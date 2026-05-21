@@ -1,7 +1,9 @@
 use crate::buffer::Buf;
 use crate::types::NamedGroup;
 use arrayvec::ArrayVec;
+use nom::Err;
 use nom::IResult;
+use nom::error::{Error, ErrorKind};
 
 /// SupportedGroups extension as defined in RFC 8422
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,7 +24,9 @@ impl SupportedGroupsExtension {
             remaining -= 2;
             // Only add supported groups
             if group.is_supported() {
-                groups.push(group);
+                groups
+                    .try_push(group)
+                    .map_err(|_| Err::Failure(Error::new(input, ErrorKind::LengthValue)))?;
             }
         }
 
@@ -96,6 +100,26 @@ mod tests {
             ext.groups.capacity(),
             NamedGroup::supported().len(),
             "SupportedGroupsExtension capacity must match all supported NamedGroups"
+        );
+    }
+
+    #[test]
+    fn too_many_supported_groups_are_rejected() {
+        let mut bytes = Vec::new();
+        let count = NamedGroup::supported().len() + 1;
+        bytes.extend_from_slice(&(count as u16 * 2).to_be_bytes());
+        for _ in 0..count {
+            bytes.extend_from_slice(&NamedGroup::X25519.as_u16().to_be_bytes());
+        }
+
+        let result = SupportedGroupsExtension::parse(&bytes);
+        assert!(
+            matches!(
+                result,
+                Err(nom::Err::Failure(error))
+                    if error.code == nom::error::ErrorKind::LengthValue
+            ),
+            "too many supported groups should fail with LengthValue"
         );
     }
 }

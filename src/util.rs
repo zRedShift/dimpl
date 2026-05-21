@@ -36,7 +36,7 @@ where
                     i = i1;
                     // Only collect items that pass the filter
                     if predicate(&o) && acc.try_push(o).is_err() {
-                        return Err(Err::Error(E::from_error_kind(i, ErrorKind::Many0)));
+                        return Err(Err::Failure(E::from_error_kind(i, ErrorKind::LengthValue)));
                     }
                 }
             }
@@ -81,7 +81,7 @@ where
                     i = i1;
                     // Only collect items that pass the filter
                     if predicate(&o) && acc.try_push(o).is_err() {
-                        return Err(Err::Error(E::from_error_kind(i, ErrorKind::Many1)));
+                        return Err(Err::Failure(E::from_error_kind(i, ErrorKind::LengthValue)));
                     }
                 }
             }

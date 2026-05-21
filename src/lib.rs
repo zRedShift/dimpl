@@ -630,6 +630,9 @@ impl Dtls {
                         // that did not offer DTLS 1.3 in supported_versions.
                         self.handle_pending_auto_server()
                     }
+                    Err(Error::ParseError(nom::error::ErrorKind::LengthValue)) => {
+                        Err(Error::ParseError(nom::error::ErrorKind::LengthValue))
+                    }
                     Err(Error::ParseError(_) | Error::ParseIncomplete) if is_ch_shaped => {
                         // The packet is structurally a ClientHello but the
                         // 1.3 parser couldn't handle it — fall back to 1.2,
@@ -898,6 +901,17 @@ mod test {
         Dtls::new_12(config, client_cert, Instant::now())
     }
 
+    fn new_instance_12_no_cookie() -> Dtls {
+        let cert = generate_self_signed_certificate().expect("Failed to generate cert");
+        let config = Arc::new(
+            Config::builder()
+                .use_server_cookie(false)
+                .build()
+                .expect("config"),
+        );
+        Dtls::new_12(config, cert, Instant::now())
+    }
+
     fn new_instance_13() -> Dtls {
         let cert = generate_self_signed_certificate().expect("Failed to generate cert");
         let config = Arc::new(Config::default());
@@ -1120,6 +1134,40 @@ mod test {
         body
     }
 
+    fn dtls13_ch_body_with_extension(extension_type: u16, extension_data: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0xFE, 0xFD]); // legacy_version
+        body.extend_from_slice(&[0u8; 32]); // random
+        body.push(0); // legacy_session_id length
+        body.push(0); // legacy_cookie length
+        body.extend_from_slice(&[0x00, 0x02]); // cipher_suites length
+        body.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
+        body.push(1); // compression_methods length
+        body.push(0); // null compression
+
+        let extension_len = 4 + extension_data.len();
+        body.extend_from_slice(&(extension_len as u16).to_be_bytes());
+        body.extend_from_slice(&extension_type.to_be_bytes());
+        body.extend_from_slice(&(extension_data.len() as u16).to_be_bytes());
+        body.extend_from_slice(extension_data);
+        body
+    }
+
+    fn dtls12_ch_body_with_extensions(extensions: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0xFE, 0xFD]); // client_version
+        body.extend_from_slice(&[0u8; 32]); // random
+        body.push(0); // session_id length
+        body.push(0); // cookie length
+        body.extend_from_slice(&[0x00, 0x02]); // cipher_suites length
+        body.extend_from_slice(&[0xC0, 0x2B]); // ECDHE_ECDSA_AES128_GCM_SHA256
+        body.push(1); // compression_methods length
+        body.push(0); // null compression
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(extensions);
+        body
+    }
+
     #[test]
     fn looks_like_client_hello_accepts_minimum_shape_ch() {
         let body = min_ch_body();
@@ -1279,6 +1327,66 @@ mod test {
             fell_back,
             "auto-sense server must fall back to DTLS 1.2 on a CH-shaped malformed packet"
         );
+    }
+
+    #[test]
+    fn auto_server_rejects_oversized_dtls13_extension_without_fallback() {
+        let supported_versions = [
+            0x08, // Four protocol versions.
+            0xFE, 0xFC, // DTLS 1.3.
+            0xFE, 0xFC, // DTLS 1.3.
+            0xFE, 0xFC, // DTLS 1.3.
+            0xFE, 0xFC, // DTLS 1.3.
+        ];
+        let body = dtls13_ch_body_with_extension(0x002B, &supported_versions);
+        let len = body.len() as u32;
+        let hs = make_handshake(0x01, len, 0, len, &body);
+        let pkt = make_record(0x16, &hs);
+        assert!(looks_like_client_hello(&pkt));
+
+        let mut dtls = new_instance_auto();
+        let err = dtls.handle_packet(&pkt).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::ParseError(nom::error::ErrorKind::LengthValue)
+        ));
+
+        let still_pending = match &dtls.inner {
+            Some(Inner::Server13(s)) => s.is_auto_mode(),
+            _ => false,
+        };
+        assert!(
+            still_pending,
+            "auto-sense server must not fall back to DTLS 1.2 on hard parser failure"
+        );
+    }
+
+    #[test]
+    fn dtls12_server_rejects_oversized_ec_point_formats_extension() {
+        let mut extensions = Vec::new();
+        extensions.extend_from_slice(&[0x00, 0x0B]); // ec_point_formats
+        extensions.extend_from_slice(&[0x00, 0x05]); // extension body length
+        extensions.extend_from_slice(&[
+            0x04, // Four point formats.
+            0x00, // Uncompressed.
+            0x00, // Uncompressed.
+            0x00, // Uncompressed.
+            0x00, // Uncompressed.
+        ]);
+        extensions.extend_from_slice(&[0x00, 0x17]); // extended_master_secret
+        extensions.extend_from_slice(&[0x00, 0x00]); // empty extension body
+
+        let body = dtls12_ch_body_with_extensions(&extensions);
+        let len = body.len() as u32;
+        let hs = make_handshake(0x01, len, 0, len, &body);
+        let pkt = make_record(0x16, &hs);
+
+        let mut dtls = new_instance_12_no_cookie();
+        let err = dtls.handle_packet(&pkt).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::ParseError(nom::error::ErrorKind::LengthValue)
+        ));
     }
 
     #[test]

@@ -1,6 +1,8 @@
 use super::super::{SignatureAndHashAlgorithm, SignatureAndHashAlgorithmVec};
 use crate::buffer::Buf;
+use nom::Err;
 use nom::IResult;
+use nom::error::{Error, ErrorKind};
 
 /// SignatureAlgorithms extension as defined in RFC 5246
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,7 +31,9 @@ impl SignatureAlgorithmsExtension {
             let (rest, alg) = SignatureAndHashAlgorithm::parse(current_input)?;
             // Only keep supported signature+hash combinations
             if alg.is_supported() {
-                algorithms.push(alg);
+                algorithms
+                    .try_push(alg)
+                    .map_err(|_| Err::Failure(Error::new(current_input, ErrorKind::LengthValue)))?;
             }
             current_input = rest;
             remaining -= 2; // Each algorithm pair is 2 bytes
@@ -92,5 +96,29 @@ mod tests {
         let (_, parsed) = SignatureAlgorithmsExtension::parse(&serialized).unwrap();
 
         assert_eq!(parsed.supported_signature_algorithms, algorithms);
+    }
+
+    #[test]
+    fn too_many_supported_signature_algorithms_are_rejected() {
+        let mut bytes = Vec::new();
+        let count = SignatureAndHashAlgorithm::supported().len() + 1;
+        bytes.extend_from_slice(&(count as u16 * 2).to_be_bytes());
+        for _ in 0..count {
+            bytes.extend_from_slice(
+                &SignatureAndHashAlgorithm::new(HashAlgorithm::SHA256, SignatureAlgorithm::ECDSA)
+                    .as_u16()
+                    .to_be_bytes(),
+            );
+        }
+
+        let result = SignatureAlgorithmsExtension::parse(&bytes);
+        assert!(
+            matches!(
+                result,
+                Err(nom::Err::Failure(error))
+                    if error.code == nom::error::ErrorKind::LengthValue
+            ),
+            "too many supported signature algorithms should fail with LengthValue"
+        );
     }
 }

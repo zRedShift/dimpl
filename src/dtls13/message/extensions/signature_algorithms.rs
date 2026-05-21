@@ -1,7 +1,9 @@
 use crate::buffer::Buf;
 use crate::types::SignatureScheme;
 use arrayvec::ArrayVec;
+use nom::Err;
 use nom::IResult;
+use nom::error::{Error, ErrorKind};
 
 /// SignatureAlgorithms extension for TLS 1.3 (RFC 8446 Section 4.2.3).
 ///
@@ -28,7 +30,9 @@ impl SignatureAlgorithmsExtension {
         while remaining > 0 {
             let (rest, scheme) = SignatureScheme::parse(current_input)?;
             if scheme.is_supported() {
-                algorithms.push(scheme);
+                algorithms
+                    .try_push(scheme)
+                    .map_err(|_| Err::Failure(Error::new(current_input, ErrorKind::LengthValue)))?;
             }
             current_input = rest;
             remaining -= 2;
@@ -90,6 +94,31 @@ mod tests {
             ext.supported_signature_algorithms.capacity(),
             SignatureScheme::supported().len(),
             "SignatureAlgorithmsExtension capacity must match supported schemes count"
+        );
+    }
+
+    #[test]
+    fn too_many_supported_signature_algorithms_are_rejected() {
+        let mut bytes = Vec::new();
+        let supported = SignatureScheme::supported();
+        let count = supported.len() + 1;
+        bytes.extend_from_slice(&(count as u16 * 2).to_be_bytes());
+        for _ in 0..count {
+            bytes.extend_from_slice(
+                &SignatureScheme::ECDSA_SECP256R1_SHA256
+                    .as_u16()
+                    .to_be_bytes(),
+            );
+        }
+
+        let result = SignatureAlgorithmsExtension::parse(&bytes);
+        assert!(
+            matches!(
+                result,
+                Err(nom::Err::Failure(error))
+                    if error.code == nom::error::ErrorKind::LengthValue
+            ),
+            "too many supported signature algorithms should fail with LengthValue"
         );
     }
 }

@@ -659,4 +659,37 @@ mod tests {
 
         assert!(rest.is_empty());
     }
+
+    #[test]
+    fn certificate_request_vector_failure_propagates_from_defragment() {
+        let body = [
+            0x02, // Two certificate types.
+            0x40, // ECDSA_SIGN.
+            0x40, // ECDSA_SIGN.
+            0x00, 0x00, // No signature algorithms.
+            0x00, 0x00, // No certificate authorities.
+        ];
+        let handshake = Handshake::new(
+            MessageType::CertificateRequest,
+            body.len() as u32,
+            0,
+            0,
+            body.len() as u32,
+            Body::Fragment(0..body.len()),
+        );
+
+        let mut defragmented_buffer = Buf::new();
+        let err = Handshake::defragment(
+            std::iter::once((&handshake, &body[..])),
+            &mut defragmented_buffer,
+            None,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            crate::Error::ParseError(nom::error::ErrorKind::LengthValue)
+        ));
+    }
 }

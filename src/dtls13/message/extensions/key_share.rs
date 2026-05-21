@@ -1,8 +1,10 @@
 use crate::buffer::Buf;
 use crate::types::NamedGroup;
 use arrayvec::ArrayVec;
+use nom::Err;
 use nom::IResult;
 use nom::bytes::complete::take;
+use nom::error::{Error, ErrorKind};
 use nom::number::complete::be_u16;
 use std::ops::Range;
 
@@ -67,7 +69,9 @@ impl KeyShareClientHello {
                 entries_base_offset + (rest.as_ptr() as usize - entries_data.as_ptr() as usize);
             let (r, entry) = KeyShareEntry::parse(rest, entry_offset)?;
             if entry.group.is_supported() {
-                entries.push(entry);
+                entries
+                    .try_push(entry)
+                    .map_err(|_| Err::Failure(Error::new(rest, ErrorKind::LengthValue)))?;
             }
             rest = r;
         }
@@ -174,5 +178,26 @@ mod tests {
         let mut serialized = Buf::new();
         parsed.serialize(&mut serialized);
         assert_eq!(&*serialized, message);
+    }
+
+    #[test]
+    fn too_many_supported_key_shares_are_rejected() {
+        let mut message = Vec::new();
+        let count = 3;
+        message.extend_from_slice(&(count as u16 * 4).to_be_bytes());
+        for _ in 0..count {
+            message.extend_from_slice(&NamedGroup::X25519.as_u16().to_be_bytes());
+            message.extend_from_slice(&0u16.to_be_bytes());
+        }
+
+        let result = KeyShareClientHello::parse(&message, 0);
+        assert!(
+            matches!(
+                result,
+                Err(nom::Err::Failure(error))
+                    if error.code == nom::error::ErrorKind::LengthValue
+            ),
+            "too many supported key shares should fail with LengthValue"
+        );
     }
 }

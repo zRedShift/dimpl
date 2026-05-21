@@ -1,8 +1,10 @@
 use crate::buffer::Buf;
 use crate::types::ProtocolVersion;
 use arrayvec::ArrayVec;
+use nom::Err;
 use nom::IResult;
 use nom::bytes::complete::take;
+use nom::error::{Error, ErrorKind};
 use nom::number::complete::be_u8;
 
 /// SupportedVersions extension in ClientHello (RFC 8446 Section 4.2.1).
@@ -20,7 +22,9 @@ impl SupportedVersionsClientHello {
         let mut rest = versions_data;
         while !rest.is_empty() {
             let (r, version) = ProtocolVersion::parse(rest)?;
-            versions.push(version);
+            versions
+                .try_push(version)
+                .map_err(|_| Err::Failure(Error::new(rest, ErrorKind::LengthValue)))?;
             rest = r;
         }
 
@@ -85,5 +89,26 @@ mod tests {
         let mut serialized = Buf::new();
         parsed.serialize(&mut serialized);
         assert_eq!(&*serialized, message);
+    }
+
+    #[test]
+    fn too_many_client_hello_versions_are_rejected() {
+        let message: &[u8] = &[
+            0x08, // list length (8 bytes = 4 versions)
+            0xFE, 0xFC, // DTLS 1.3
+            0xFE, 0xFD, // DTLS 1.2
+            0xFE, 0xFF, // DTLS 1.0
+            0xFE, 0xFE, // Unknown
+        ];
+
+        let result = SupportedVersionsClientHello::parse(message);
+        assert!(
+            matches!(
+                result,
+                Err(nom::Err::Failure(error))
+                    if error.code == nom::error::ErrorKind::LengthValue
+            ),
+            "too many supported versions should fail with LengthValue"
+        );
     }
 }

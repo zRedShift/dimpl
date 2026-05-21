@@ -1,6 +1,7 @@
 use crate::buffer::Buf;
 use arrayvec::ArrayVec;
-use nom::{IResult, number::complete::be_u8};
+use nom::error::{Error, ErrorKind};
+use nom::{Err, IResult, number::complete::be_u8};
 
 /// EC Point Format as defined in RFC 4492 Section 5.1.2
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -59,8 +60,11 @@ impl ECPointFormatsExtension {
         let mut current_input = input;
 
         while remaining > 0 {
+            let format_input = current_input;
             let (rest, format) = ECPointFormat::parse(current_input)?;
-            formats.push(format);
+            formats
+                .try_push(format)
+                .map_err(|_| Err::Failure(Error::new(format_input, ErrorKind::LengthValue)))?;
             current_input = rest;
             remaining -= 1; // Each format is 1 byte
         }
@@ -106,5 +110,26 @@ mod tests {
         let (_, parsed) = ECPointFormatsExtension::parse(&serialized).unwrap();
 
         assert_eq!(parsed.formats.as_slice(), ext.formats.as_slice());
+    }
+
+    #[test]
+    fn too_many_ec_point_formats_are_rejected() {
+        let bytes = [
+            0x04, // Four point formats.
+            0x00, // Uncompressed.
+            0x00, // Uncompressed.
+            0x00, // Uncompressed.
+            0x00, // Uncompressed.
+        ];
+
+        let err = ECPointFormatsExtension::parse(&bytes).unwrap_err();
+
+        assert!(matches!(
+            err,
+            Err::Failure(Error {
+                code: ErrorKind::LengthValue,
+                ..
+            })
+        ));
     }
 }
