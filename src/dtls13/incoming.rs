@@ -156,52 +156,8 @@ impl Records {
 
         // Find record boundaries and copy each record ONCE from the packet
         while !packet.is_empty() {
-            let record_end = if Dtls13Record::is_ciphertext_header(packet[0]) {
-                // CID bit set means we can't determine record boundaries (unsupported).
-                // Discard the rest of the datagram.
-                if packet[0] & 0x10 != 0 {
-                    break;
-                }
-
-                // Unified header: variable length
-                if packet.len() < 2 {
-                    return Err(Error::ParseIncomplete);
-                }
-
-                let flags = packet[0];
-                let s_flag = flags & 0b0000_1000 != 0;
-                let l_flag = flags & 0b0000_0100 != 0;
-                let seq_len = if s_flag { 2 } else { 1 };
-                let len_len = if l_flag { 2 } else { 0 };
-                let header_len = 1 + seq_len + len_len;
-
-                if packet.len() < header_len {
-                    return Err(Error::ParseIncomplete);
-                }
-
-                if l_flag {
-                    let len_offset = 1 + seq_len;
-                    // unwrap: header_len check above ensures 2 bytes at len_offset
-                    let length_bytes: [u8; 2] =
-                        packet[len_offset..len_offset + 2].try_into().unwrap();
-                    let length = u16::from_be_bytes(length_bytes) as usize;
-                    header_len + length
-                } else {
-                    // No length field: record consumes the rest of the datagram
-                    packet.len()
-                }
-            } else {
-                // Plaintext: fixed 13-byte header
-                if packet.len() < Dtls13Record::PLAINTEXT_HEADER_LEN {
-                    return Err(Error::ParseIncomplete);
-                }
-
-                // unwrap: PLAINTEXT_HEADER_LEN check above ensures 2 bytes at offset
-                let length_bytes: [u8; 2] = packet[Dtls13Record::PLAINTEXT_LENGTH_OFFSET]
-                    .try_into()
-                    .unwrap();
-                let length = u16::from_be_bytes(length_bytes) as usize;
-                Dtls13Record::PLAINTEXT_HEADER_LEN + length
+            let Some(record_end) = record_end(packet)? else {
+                break;
             };
 
             if packet.len() < record_end {
@@ -241,6 +197,7 @@ impl Records {
 
                         should_break_after_replay_update = should_defer_tail;
                         if should_defer_tail {
+                            validate_record_boundaries(tail, parsed_record_count)?;
                             let mut tail_buffer = Buf::new();
                             tail_buffer.extend_from_slice(tail);
                             deferred_tail = Some(tail_buffer);
@@ -288,6 +245,79 @@ impl Records {
             deferred_tail,
         })
     }
+}
+
+fn record_end(packet: &[u8]) -> Result<Option<usize>, Error> {
+    if Dtls13Record::is_ciphertext_header(packet[0]) {
+        // CID bit set means we can't determine record boundaries (unsupported).
+        // Discard the rest of the datagram.
+        if packet[0] & 0x10 != 0 {
+            return Ok(None);
+        }
+
+        // Unified header: variable length
+        if packet.len() < 2 {
+            return Err(Error::ParseIncomplete);
+        }
+
+        let flags = packet[0];
+        let s_flag = flags & 0b0000_1000 != 0;
+        let l_flag = flags & 0b0000_0100 != 0;
+        let seq_len = if s_flag { 2 } else { 1 };
+        let len_len = if l_flag { 2 } else { 0 };
+        let header_len = 1 + seq_len + len_len;
+
+        if packet.len() < header_len {
+            return Err(Error::ParseIncomplete);
+        }
+
+        if l_flag {
+            let len_offset = 1 + seq_len;
+            // unwrap: header_len check above ensures 2 bytes at len_offset
+            let length_bytes: [u8; 2] = packet[len_offset..len_offset + 2].try_into().unwrap();
+            let length = u16::from_be_bytes(length_bytes) as usize;
+            Ok(Some(header_len + length))
+        } else {
+            // No length field: record consumes the rest of the datagram
+            Ok(Some(packet.len()))
+        }
+    } else {
+        // Plaintext: fixed 13-byte header
+        if packet.len() < Dtls13Record::PLAINTEXT_HEADER_LEN {
+            return Err(Error::ParseIncomplete);
+        }
+
+        // unwrap: PLAINTEXT_HEADER_LEN check above ensures 2 bytes at offset
+        let length_bytes: [u8; 2] = packet[Dtls13Record::PLAINTEXT_LENGTH_OFFSET]
+            .try_into()
+            .unwrap();
+        let length = u16::from_be_bytes(length_bytes) as usize;
+        Ok(Some(Dtls13Record::PLAINTEXT_HEADER_LEN + length))
+    }
+}
+
+fn validate_record_boundaries(
+    mut packet: &[u8],
+    mut parsed_record_count: usize,
+) -> Result<(), Error> {
+    while !packet.is_empty() {
+        let Some(end) = record_end(packet)? else {
+            return Ok(());
+        };
+
+        if parsed_record_count >= 16 {
+            return Err(Error::TooManyRecords);
+        }
+        parsed_record_count += 1;
+
+        if packet.len() < end {
+            return Err(Error::ParseIncomplete);
+        }
+
+        packet = &packet[end..];
+    }
+
+    Ok(())
 }
 
 fn pending_replay_check(pending_replay: &ArrayVec<(u16, ReplayWindow), 16>, seq: Sequence) -> bool {
