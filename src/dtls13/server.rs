@@ -139,6 +139,9 @@ pub struct Server {
     /// Whether we need to respond with our own KeyUpdate.
     pending_key_update_response: bool,
 
+    /// Whether a peer KeyUpdate ACK needs to be retried.
+    pending_key_update_ack: bool,
+
     /// When true, a ClientHello without DTLS 1.3 in `supported_versions`
     /// returns [`Error::Dtls12Fallback`] instead of a security error.
     /// Used by the auto-sense server path.
@@ -208,6 +211,7 @@ impl Server {
             hello_retry: false,
             cookie_secret,
             pending_key_update_response: false,
+            pending_key_update_ack: false,
             auto_mode,
             retained_hello: VecDeque::with_capacity(10),
         }
@@ -331,6 +335,22 @@ impl Server {
         Ok(())
     }
 
+    fn send_pending_key_update_ack(&mut self) -> Result<(), Error> {
+        if !self.pending_key_update_ack {
+            return Ok(());
+        }
+
+        let result = if self.engine.is_key_update_in_flight() {
+            self.engine.send_ack_with_previous_app_epoch()
+        } else {
+            self.engine.send_ack()
+        };
+
+        result?;
+        self.pending_key_update_ack = false;
+        Ok(())
+    }
+
     fn handle_incoming_key_update(&mut self) -> Result<(), Error> {
         if self.engine.has_complete_handshake(MessageType::KeyUpdate) {
             let maybe = self.engine.next_handshake_no_transcript(
@@ -345,21 +365,15 @@ impl Server {
 
                 // Install new recv keys
                 self.engine.update_recv_keys()?;
+                self.engine.advance_peer_handshake_seq();
+                self.pending_key_update_ack = true;
 
                 // If peer requested us to update, schedule our own KeyUpdate
-                let local_key_update_in_flight = self.engine.is_key_update_in_flight();
                 if request == KeyUpdateRequest::UpdateRequested {
                     self.pending_key_update_response = true;
-                    if local_key_update_in_flight {
-                        self.engine.send_ack_with_previous_app_epoch()?;
-                    } else {
-                        self.engine.send_ack()?;
-                    }
-                } else {
-                    self.engine.send_ack()?;
                 }
+                self.send_pending_key_update_ack()?;
 
-                self.engine.advance_peer_handshake_seq();
                 debug!("Received KeyUpdate (request={:?})", request);
 
                 // Drain a fresh peer-requested response in the same progress
@@ -1209,6 +1223,7 @@ impl State {
         // Incoming peer requests require an update_not_requested response. They
         // take priority over local AEAD-limit updates and queued app data.
         server.handle_incoming_key_update()?;
+        server.send_pending_key_update_ack()?;
         server.send_pending_key_update_response()?;
 
         // Auto-trigger KeyUpdate when AEAD encryption limit is reached

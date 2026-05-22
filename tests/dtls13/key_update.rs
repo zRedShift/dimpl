@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dimpl::{Config, Dtls};
+use dimpl::{Config, Dtls, Error};
 
 use crate::common::*;
 
@@ -709,6 +709,93 @@ fn assert_peer_requested_response_waits_for_local_update_ack(
     );
 }
 
+#[cfg(feature = "rcgen")]
+fn assert_peer_key_update_ack_retries_after_transmit_backpressure(
+    sender: &mut Dtls,
+    receiver: &mut Dtls,
+    now: &mut Instant,
+    label: &str,
+    receiver_occupant: &[u8],
+    sender_after_retry: &[u8],
+) {
+    let key_update = trigger_key_update(sender, receiver, now, label);
+    assert_eq!(key_update.len(), 1, "test expects one KeyUpdate datagram");
+
+    receiver
+        .send_application_data(receiver_occupant)
+        .expect("receiver queues one app-data packet to occupy transmit queue");
+
+    let err = receiver
+        .handle_packet(&key_update[0])
+        .expect_err("receiver KeyUpdate ACK should hit transmit backpressure");
+    assert!(
+        matches!(err, Error::TransmitQueueFull),
+        "expected TransmitQueueFull, got {err:?}"
+    );
+
+    let occupied = collect_packets(receiver);
+    assert_eq!(
+        occupied.len(),
+        1,
+        "only the pre-existing app-data packet should be queued after failed ACK"
+    );
+    deliver_packets(&occupied, sender);
+    sender
+        .handle_timeout(*now)
+        .expect("sender handles receiver occupant");
+    let sender_after_occupant = drain_outputs(sender);
+    assert!(
+        sender_after_occupant
+            .app_data
+            .iter()
+            .any(|received| received == receiver_occupant),
+        "sender should receive the packet that occupied receiver output"
+    );
+
+    receiver
+        .handle_timeout(*now)
+        .expect("receiver retries pending KeyUpdate ACK after queue drains");
+    let retried_ack_and_response = collect_packets(receiver);
+    assert!(
+        !retried_ack_and_response.is_empty(),
+        "receiver should retry the ACK and peer-requested response"
+    );
+    deliver_packets(&retried_ack_and_response, sender);
+
+    sender
+        .handle_timeout(*now)
+        .expect("sender handles retried ACK and response");
+    let sender_ack_for_response = collect_packets(sender);
+    deliver_packets(&sender_ack_for_response, receiver);
+
+    receiver
+        .handle_packet(&key_update[0])
+        .expect("duplicate KeyUpdate must not derive receive keys a second time");
+    receiver
+        .handle_timeout(*now)
+        .expect("receiver handles duplicate after retry");
+    let duplicate_output = collect_packets(receiver);
+    deliver_packets(&duplicate_output, sender);
+
+    sender
+        .send_application_data(sender_after_retry)
+        .expect("sender sends after duplicate KeyUpdate");
+    let post_retry = collect_packets(sender);
+    assert_eq!(post_retry.len(), 1);
+    deliver_packets(&post_retry, receiver);
+    receiver
+        .handle_timeout(*now)
+        .expect("receiver handles sender data after duplicate");
+    let received = drain_outputs(receiver);
+    assert!(
+        received
+            .app_data
+            .iter()
+            .any(|data| data == sender_after_retry),
+        "receiver should decrypt later sender data after exactly one receive-key update"
+    );
+}
+
 /// A peer-requested KeyUpdate response should be emitted in the same progress
 /// pass when no local KeyUpdate is in flight. Otherwise it can sit pending
 /// until unrelated input or a timeout drives the state machine again.
@@ -780,6 +867,53 @@ fn dtls13_peer_requested_key_update_response_drains_immediately_without_local_up
     assert_eq!(
         server_after_response.app_data,
         vec![b"client-after-immediate-response".to_vec()]
+    );
+}
+
+/// If the client's transmit queue is full while ACKing a peer KeyUpdate, the
+/// client must not reprocess the same KeyUpdate on retry. Receive keys and peer
+/// handshake sequence advancement stay transactional with ACK retry state.
+#[test]
+#[cfg(feature = "rcgen")]
+fn dtls13_client_peer_key_update_ack_backpressure_retries_without_rederiving() {
+    use dimpl::certificate::generate_self_signed_certificate;
+
+    let _ = env_logger::try_init();
+
+    let client_config = Arc::new(
+        Config::builder()
+            .aead_encryption_limit(16)
+            .max_queue_tx(1)
+            .build()
+            .expect("build client config"),
+    );
+    let server_config = Arc::new(
+        Config::builder()
+            .aead_encryption_limit(2)
+            .build()
+            .expect("build server config"),
+    );
+
+    let mut now = Instant::now();
+
+    let client_cert = generate_self_signed_certificate().expect("gen client cert");
+    let server_cert = generate_self_signed_certificate().expect("gen server cert");
+
+    let mut client = Dtls::new_13(client_config, client_cert, now);
+    client.set_active(true);
+
+    let mut server = Dtls::new_13(server_config, server_cert, now);
+    server.set_active(false);
+
+    now = complete_dtls13_handshake(&mut client, &mut server, now);
+
+    assert_peer_key_update_ack_retries_after_transmit_backpressure(
+        &mut server,
+        &mut client,
+        &mut now,
+        "server-to-client-backpressure",
+        &[b'c'; 1150],
+        b"server-after-client-ack-retry",
     );
 }
 
@@ -902,6 +1036,52 @@ fn dtls13_server_peer_requested_key_update_response_drains_immediately_without_l
             .iter()
             .any(|received| received == b"server-after-immediate-response"),
         "client should receive post-response app data"
+    );
+}
+
+/// Same as the client backpressure case, but with the server receiving the
+/// peer KeyUpdate while its transmit queue is full.
+#[test]
+#[cfg(feature = "rcgen")]
+fn dtls13_server_peer_key_update_ack_backpressure_retries_without_rederiving() {
+    use dimpl::certificate::generate_self_signed_certificate;
+
+    let _ = env_logger::try_init();
+
+    let client_config = Arc::new(
+        Config::builder()
+            .aead_encryption_limit(2)
+            .build()
+            .expect("build client config"),
+    );
+    let server_config = Arc::new(
+        Config::builder()
+            .aead_encryption_limit(16)
+            .max_queue_tx(1)
+            .build()
+            .expect("build server config"),
+    );
+
+    let mut now = Instant::now();
+
+    let client_cert = generate_self_signed_certificate().expect("gen client cert");
+    let server_cert = generate_self_signed_certificate().expect("gen server cert");
+
+    let mut client = Dtls::new_13(client_config, client_cert, now);
+    client.set_active(true);
+
+    let mut server = Dtls::new_13(server_config, server_cert, now);
+    server.set_active(false);
+
+    now = complete_dtls13_handshake(&mut client, &mut server, now);
+
+    assert_peer_key_update_ack_retries_after_transmit_backpressure(
+        &mut client,
+        &mut server,
+        &mut now,
+        "client-to-server-backpressure",
+        &[b's'; 1150],
+        b"client-after-server-ack-retry",
     );
 }
 
