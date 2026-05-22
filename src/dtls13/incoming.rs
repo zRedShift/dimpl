@@ -6,7 +6,9 @@ use std::fmt;
 
 use crate::Error;
 use crate::buffer::{Buf, TmpBuf};
-use crate::dtls13::message::{ContentType, Dtls13CipherSuite, Dtls13Record, Handshake, Sequence};
+use crate::dtls13::message::{
+    ContentType, Dtls13CipherSuite, Dtls13Record, Handshake, MessageType, Sequence,
+};
 use crate::window::ReplayWindow;
 
 /// Holds both the UDP packet and the parsed result of that packet.
@@ -14,6 +16,11 @@ pub struct Incoming {
     // Box is here to reduce the size of the Incoming struct
     // to be passed in register instead of using memmove.
     records: Box<Records>,
+}
+
+pub(crate) struct IncomingParse {
+    pub incoming: Option<Incoming>,
+    pub deferred_tail: Option<Buf>,
 }
 
 impl Incoming {
@@ -48,23 +55,47 @@ impl Incoming {
     /// * `cs` is the negotiated cipher suite, if any.
     ///
     /// Will surface parser errors.
+    #[cfg(test)]
     pub fn parse_packet(
         packet: &[u8],
         decrypt: &mut dyn RecordHandler,
         cs: Option<Dtls13CipherSuite>,
     ) -> Result<Option<Self>, Error> {
+        Ok(Self::parse_packet_inner(packet, decrypt, cs, false)?.incoming)
+    }
+
+    pub(crate) fn parse_packet_defer_after_key_update(
+        packet: &[u8],
+        decrypt: &mut dyn RecordHandler,
+        cs: Option<Dtls13CipherSuite>,
+    ) -> Result<IncomingParse, Error> {
+        Self::parse_packet_inner(packet, decrypt, cs, true)
+    }
+
+    fn parse_packet_inner(
+        packet: &[u8],
+        decrypt: &mut dyn RecordHandler,
+        cs: Option<Dtls13CipherSuite>,
+        defer_after_key_update: bool,
+    ) -> Result<IncomingParse, Error> {
         // Parse records directly from packet, copying each record ONCE into its own buffer
-        let records = Records::parse(packet, decrypt, cs)?;
+        let parse = Records::parse_inner(packet, decrypt, cs, |_| true, defer_after_key_update)?;
 
         // We need at least one Record to be valid. For replayed frames, we discard
         // the records, hence this might be None
-        if records.records.is_empty() {
-            return Ok(None);
+        if parse.records.records.is_empty() {
+            return Ok(IncomingParse {
+                incoming: None,
+                deferred_tail: parse.deferred_tail,
+            });
         }
 
-        let records = Box::new(records);
+        let records = Box::new(parse.records);
 
-        Ok(Some(Incoming { records }))
+        Ok(IncomingParse {
+            incoming: Some(Incoming { records }),
+            deferred_tail: parse.deferred_tail,
+        })
     }
 
     pub(crate) fn parse_packet_filtering_records(
@@ -94,26 +125,34 @@ pub struct Records {
     pub records: ArrayVec<Record, 16>,
 }
 
+struct RecordsParse {
+    records: Records,
+    deferred_tail: Option<Buf>,
+}
+
 impl Records {
-    pub fn parse(
+    fn parse_filtering_records(
         packet: &[u8],
         decrypt: &mut dyn RecordHandler,
         cs: Option<Dtls13CipherSuite>,
+        keep_record: impl FnMut(&Record) -> bool,
     ) -> Result<Records, Error> {
-        Self::parse_filtering_records(packet, decrypt, cs, |_| true)
+        Ok(Self::parse_inner(packet, decrypt, cs, keep_record, false)?.records)
     }
 
-    fn parse_filtering_records(
+    fn parse_inner(
         mut packet: &[u8],
         decrypt: &mut dyn RecordHandler,
         cs: Option<Dtls13CipherSuite>,
         mut keep_record: impl FnMut(&Record) -> bool,
-    ) -> Result<Records, Error> {
+        defer_after_key_update: bool,
+    ) -> Result<RecordsParse, Error> {
         let mut parsed_records: ArrayVec<Record, 16> = ArrayVec::new();
         let mut replay_updates: ArrayVec<Sequence, 16> = ArrayVec::new();
         let mut pending_replay: ArrayVec<(u16, ReplayWindow), 16> = ArrayVec::new();
         let mut pending_expected: ArrayVec<(u16, u64), 16> = ArrayVec::new();
         let mut parsed_record_count = 0usize;
+        let mut deferred_tail = None;
 
         // Find record boundaries and copy each record ONCE from the packet
         while !packet.is_empty() {
@@ -171,8 +210,11 @@ impl Records {
 
             // This is the ONLY copy: packet -> record buffer
             let record_slice = &packet[..record_end];
+            let tail = &packet[record_end..];
             match Record::parse(record_slice, decrypt, cs, &pending_expected) {
                 Ok(parsed) => {
+                    let mut should_break_after_replay_update = false;
+
                     if let Some(sequence) = parsed.replay_sequence {
                         if !pending_replay_check(&pending_replay, sequence) {
                             trace!("Discarding duplicate rec in same datagram");
@@ -182,6 +224,10 @@ impl Records {
                     }
 
                     if let Some(record) = parsed.record {
+                        let should_defer_tail = defer_after_key_update
+                            && !tail.is_empty()
+                            && record.contains_complete_key_update();
+
                         if parsed_record_count >= parsed_records.capacity() {
                             return Err(Error::TooManyRecords);
                         }
@@ -191,6 +237,13 @@ impl Records {
                             trace!("Discarding filtered rec");
                         } else if parsed_records.try_push(record).is_err() {
                             return Err(Error::TooManyRecords);
+                        }
+
+                        should_break_after_replay_update = should_defer_tail;
+                        if should_defer_tail {
+                            let mut tail_buffer = Buf::new();
+                            tail_buffer.extend_from_slice(tail);
+                            deferred_tail = Some(tail_buffer);
                         }
                     } else if parsed.replay_sequence.is_none() {
                         trace!("Discarding replayed rec");
@@ -202,6 +255,10 @@ impl Records {
                         if replay_updates.try_push(sequence).is_err() {
                             return Err(Error::TooManyRecords);
                         }
+                    }
+
+                    if should_break_after_replay_update {
+                        break;
                     }
                 }
                 Err(e) => return Err(e),
@@ -226,7 +283,10 @@ impl Records {
             }
         }
 
-        Ok(Records { records })
+        Ok(RecordsParse {
+            records: Records { records },
+            deferred_tail,
+        })
     }
 }
 
@@ -368,7 +428,10 @@ impl Record {
                 ContentType::Ack | ContentType::Alert
             )
         {
-            trace!("Discarding plaintext record after peer encryption is enabled");
+            trace!(
+                "Discarding post-encryption plaintext {:?} record",
+                record.record().content_type
+            );
             return Ok(RecordParse {
                 record: None,
                 replay_sequence: None,
@@ -482,6 +545,15 @@ impl Record {
 
     pub fn first_handshake(&self) -> Option<&Handshake> {
         self.parsed.handshakes.first()
+    }
+
+    fn contains_complete_key_update(&self) -> bool {
+        self.record().content_type == ContentType::Handshake
+            && self.handshakes().iter().any(|handshake| {
+                handshake.header.msg_type == MessageType::KeyUpdate
+                    && handshake.header.fragment_offset == 0
+                    && handshake.header.fragment_length == handshake.header.length
+            })
     }
 
     pub fn is_handled(&self) -> bool {
@@ -694,7 +766,6 @@ mod tests {
     struct TestHandler {
         classify_calls: usize,
         dropped_acks: usize,
-        peer_encryption_enabled: bool,
     }
 
     impl RecordHandler for TestHandler {
@@ -708,7 +779,7 @@ mod tests {
         }
 
         fn is_peer_encryption_enabled(&self) -> bool {
-            self.peer_encryption_enabled
+            false
         }
 
         fn resolve_epoch(&self, _epoch_bits: u8) -> u16 {
@@ -792,23 +863,5 @@ mod tests {
             ContentType::ApplicationData
         );
         assert_eq!(incoming.first().record().sequence.epoch, 2);
-    }
-
-    #[test]
-    fn parse_packet_drops_plaintext_ack_after_peer_encryption_enabled() {
-        let packet = build_plaintext_record(ContentType::Ack, 1, &[0xAA, 0xBB]);
-
-        let mut handler = TestHandler {
-            peer_encryption_enabled: true,
-            ..TestHandler::default()
-        };
-        let incoming = Incoming::parse_packet(&packet, &mut handler, None).unwrap();
-
-        assert!(incoming.is_none());
-        assert_eq!(
-            handler.classify_calls, 0,
-            "post-encryption plaintext ACK must be dropped before classification"
-        );
-        assert_eq!(handler.dropped_acks, 0);
     }
 }

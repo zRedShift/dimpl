@@ -290,6 +290,9 @@ impl Server {
             }
         }
         self.make_progress()?;
+        while self.engine.parse_next_deferred_packet()? {
+            self.make_progress()?;
+        }
 
         if self.auto_mode && !self.can_fallback_to_dtls12() {
             self.retained_hello.clear();
