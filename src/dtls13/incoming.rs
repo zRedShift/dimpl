@@ -361,6 +361,20 @@ impl Record {
         let parsed = Box::new(parsed);
         let record = Record { buffer, parsed };
 
+        if !is_ciphertext
+            && decrypt.is_peer_encryption_enabled()
+            && matches!(
+                record.record().content_type,
+                ContentType::Ack | ContentType::Alert
+            )
+        {
+            trace!("Discarding plaintext record after peer encryption is enabled");
+            return Ok(RecordParse {
+                record: None,
+                replay_sequence: None,
+            });
+        }
+
         // Plaintext records (epoch 0) are not encrypted
         if !is_ciphertext || !decrypt.is_peer_encryption_enabled() {
             return Ok(RecordParse {
@@ -680,6 +694,7 @@ mod tests {
     struct TestHandler {
         classify_calls: usize,
         dropped_acks: usize,
+        peer_encryption_enabled: bool,
     }
 
     impl RecordHandler for TestHandler {
@@ -693,7 +708,7 @@ mod tests {
         }
 
         fn is_peer_encryption_enabled(&self) -> bool {
-            false
+            self.peer_encryption_enabled
         }
 
         fn resolve_epoch(&self, _epoch_bits: u8) -> u16 {
@@ -777,5 +792,23 @@ mod tests {
             ContentType::ApplicationData
         );
         assert_eq!(incoming.first().record().sequence.epoch, 2);
+    }
+
+    #[test]
+    fn parse_packet_drops_plaintext_ack_after_peer_encryption_enabled() {
+        let packet = build_plaintext_record(ContentType::Ack, 1, &[0xAA, 0xBB]);
+
+        let mut handler = TestHandler {
+            peer_encryption_enabled: true,
+            ..TestHandler::default()
+        };
+        let incoming = Incoming::parse_packet(&packet, &mut handler, None).unwrap();
+
+        assert!(incoming.is_none());
+        assert_eq!(
+            handler.classify_calls, 0,
+            "post-encryption plaintext ACK must be dropped before classification"
+        );
+        assert_eq!(handler.dropped_acks, 0);
     }
 }

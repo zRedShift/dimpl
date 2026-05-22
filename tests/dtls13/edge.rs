@@ -977,6 +977,134 @@ fn dtls13_discards_plaintext_after_handshake() {
 
 #[test]
 #[cfg(feature = "rcgen")]
+fn dtls13_post_encryption_plaintext_close_notify_is_ignored() {
+    let _ = env_logger::try_init();
+
+    let client_cert = generate_self_signed_certificate().expect("gen client cert");
+    let server_cert = generate_self_signed_certificate().expect("gen server cert");
+
+    let config = dtls13_config();
+
+    let mut now = Instant::now();
+
+    let mut client = Dtls::new_13(Arc::clone(&config), client_cert, now);
+    client.set_active(true);
+
+    let mut server = Dtls::new_13(config, server_cert, now);
+    server.set_active(false);
+
+    now = complete_dtls13_handshake(&mut client, &mut server, now);
+
+    server
+        .handle_packet(&dtls13_alert_record(0x100, 1, 0))
+        .expect("post-encryption plaintext close_notify should be ignored");
+
+    let after_plaintext_alert = drain_outputs(&mut server);
+    assert!(
+        !after_plaintext_alert.close_notify,
+        "plaintext close_notify after encryption must not close the connection"
+    );
+
+    client
+        .send_application_data(b"after-plaintext-close-notify")
+        .expect("send app data");
+    client.handle_timeout(now).expect("client timeout");
+    let client_out = drain_outputs(&mut client);
+    deliver_packets(&client_out.packets, &mut server);
+
+    server.handle_timeout(now).expect("server timeout");
+    let server_out = drain_outputs(&mut server);
+    assert!(
+        server_out
+            .app_data
+            .iter()
+            .any(|d| d.as_slice() == b"after-plaintext-close-notify"),
+        "server should accept encrypted app data after plaintext close_notify"
+    );
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
+fn dtls13_post_encryption_plaintext_fatal_alert_is_ignored() {
+    let _ = env_logger::try_init();
+
+    let client_cert = generate_self_signed_certificate().expect("gen client cert");
+    let server_cert = generate_self_signed_certificate().expect("gen server cert");
+
+    let config = dtls13_config();
+
+    let mut now = Instant::now();
+
+    let mut client = Dtls::new_13(Arc::clone(&config), client_cert, now);
+    client.set_active(true);
+
+    let mut server = Dtls::new_13(config, server_cert, now);
+    server.set_active(false);
+
+    now = complete_dtls13_handshake(&mut client, &mut server, now);
+
+    server
+        .handle_packet(&dtls13_alert_record(0x101, 2, 40))
+        .expect("post-encryption plaintext fatal alert should be ignored");
+
+    client
+        .send_application_data(b"after-plaintext-fatal-alert")
+        .expect("send app data");
+    client.handle_timeout(now).expect("client timeout");
+    let client_out = drain_outputs(&mut client);
+    deliver_packets(&client_out.packets, &mut server);
+
+    server.handle_timeout(now).expect("server timeout");
+    let server_out = drain_outputs(&mut server);
+    assert!(
+        server_out
+            .app_data
+            .iter()
+            .any(|d| d.as_slice() == b"after-plaintext-fatal-alert"),
+        "server should accept encrypted app data after plaintext fatal alert"
+    );
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
+fn dtls13_duplicate_client_hello_still_triggers_retransmit_after_peer_encryption() {
+    let _ = env_logger::try_init();
+
+    let client_cert = generate_self_signed_certificate().expect("gen client cert");
+    let server_cert = generate_self_signed_certificate().expect("gen server cert");
+
+    let config = dtls13_config();
+
+    let now = Instant::now();
+
+    let mut client = Dtls::new_13(Arc::clone(&config), client_cert, now);
+    client.set_active(true);
+
+    let mut server = Dtls::new_13(config, server_cert, now);
+    server.set_active(false);
+
+    client.handle_timeout(now).expect("client timeout");
+    let client_hello = collect_packets(&mut client);
+    assert!(!client_hello.is_empty(), "client should emit ClientHello");
+
+    deliver_packets(&client_hello, &mut server);
+    server.handle_timeout(now).expect("server timeout");
+    let first_server_flight = collect_packets(&mut server);
+    assert!(
+        !first_server_flight.is_empty(),
+        "server should emit ServerHello plus encrypted handshake flight"
+    );
+
+    deliver_packets(&client_hello, &mut server);
+    let retransmit = collect_packets(&mut server);
+    assert!(
+        !retransmit.is_empty(),
+        "duplicate plaintext ClientHello should still trigger server flight retransmission"
+    );
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
 fn dtls13_alert_bad_certificate() {
     // NOTE: dimpl does not perform certificate chain/trust validation. The library
     // surfaces the peer's leaf certificate via Output::PeerCert and delegates all
