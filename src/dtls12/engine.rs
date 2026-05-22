@@ -214,6 +214,20 @@ impl Engine {
         Ok(())
     }
 
+    pub(crate) fn parse_packet_filtering_records(
+        &mut self,
+        packet: &[u8],
+        keep_record: impl FnMut(&Record) -> bool,
+    ) -> Result<(), Error> {
+        let cs = self.cipher_suite;
+        let incoming = Incoming::parse_packet_filtering_records(packet, self, cs, keep_record)?;
+        if let Some(incoming) = incoming {
+            self.insert_incoming(incoming)?;
+        }
+
+        Ok(())
+    }
+
     /// Insert a parsed datagram into the receive queue.
     fn insert_incoming(&mut self, incoming: Incoming) -> Result<(), Error> {
         // Capacity guard before iterating records.

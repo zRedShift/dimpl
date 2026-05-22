@@ -627,9 +627,11 @@ impl Dtls {
                 // took — same cost whether handle_packet returns Ok,
                 // Dtls12Fallback, ParseError, or anything else.
                 let is_ch_shaped = looks_like_client_hello(packet);
+                let retained_count_before = server.retained_packet_count();
+                let can_fallback_to_dtls12 = server.can_fallback_to_dtls12();
                 match server.handle_packet(packet) {
                     Ok(()) => Ok(()),
-                    Err(Error::Dtls12Fallback) => {
+                    Err(Error::Dtls12Fallback) if can_fallback_to_dtls12 => {
                         // The 1.3 engine cleanly rejected a ClientHello
                         // that did not offer DTLS 1.3 in supported_versions.
                         self.handle_pending_auto_server()
@@ -637,13 +639,28 @@ impl Dtls {
                     Err(Error::ParseError(nom::error::ErrorKind::LengthValue)) => {
                         Err(Error::ParseError(nom::error::ErrorKind::LengthValue))
                     }
-                    Err(Error::ParseError(_) | Error::ParseIncomplete) if is_ch_shaped => {
+                    Err(Error::ParseError(_) | Error::ParseIncomplete)
+                        if can_fallback_to_dtls12 && is_ch_shaped && retained_count_before == 0 =>
+                    {
                         // The packet is structurally a ClientHello but the
                         // 1.3 parser couldn't handle it — fall back to 1.2,
                         // which has a more permissive parser. Random/garbage
-                        // traffic that happens to error is not caught here,
-                        // so an off-path attacker cannot force a downgrade
-                        // by spraying malformed packets.
+                        // traffic, and malformed later packets after retained
+                        // pre-HRR state, are not caught here, so an off-path
+                        // attacker cannot force a downgrade by spraying
+                        // malformed packets.
+                        self.handle_pending_auto_server()
+                    }
+                    Err(Error::ParseError(_) | Error::ParseIncomplete)
+                        if can_fallback_to_dtls12
+                            && server.any_retained_packet_from(
+                                retained_count_before,
+                                looks_like_client_hello,
+                            ) =>
+                    {
+                        // The raw datagram may have contained filtered junk
+                        // before a real ClientHello. Gate fallback on the
+                        // sanitized retained records, not the raw packet.
                         self.handle_pending_auto_server()
                     }
                     Err(e) => Err(e),

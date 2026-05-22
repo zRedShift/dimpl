@@ -53,6 +53,74 @@ fn run_handshake(
     )
 }
 
+fn dtls13_future_epoch_ciphertext(seq: u16) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(0x2E); // fixed bits, S=1, L=1, epoch_bits=2
+    out.extend_from_slice(&seq.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes()); // empty ciphertext
+    out
+}
+
+fn ch_shaped_malformed_packet_with_message_seq(message_seq: u16) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0xFE, 0xFD]); // version
+    body.extend_from_slice(&[0u8; 32]); // random
+    body.push(0); // session_id_length = 0
+    body.push(0); // cookie_length = 0
+    body.extend_from_slice(&[0xFF, 0xFF]); // cipher_suites_length = 65535
+    body.extend_from_slice(&[0xC0, 0x2B]); // incomplete cipher suite list
+    body.push(1); // compression_methods_length = 1
+    body.push(0); // null compression
+
+    let mut handshake = Vec::new();
+    let len = body.len() as u32;
+    handshake.push(0x01); // ClientHello
+    handshake.extend_from_slice(&len.to_be_bytes()[1..]);
+    handshake.extend_from_slice(&message_seq.to_be_bytes());
+    handshake.extend_from_slice(&0u32.to_be_bytes()[1..]); // fragment_offset
+    handshake.extend_from_slice(&len.to_be_bytes()[1..]); // fragment_length
+    handshake.extend_from_slice(&body);
+
+    let mut packet = Vec::new();
+    packet.push(0x16); // Handshake
+    packet.extend_from_slice(&[0xFE, 0xFD]); // DTLS 1.2 legacy record version
+    packet.extend_from_slice(&0u16.to_be_bytes()); // epoch
+    packet.extend_from_slice(&[0u8; 6]); // sequence
+    packet.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+    packet.extend_from_slice(&handshake);
+    packet
+}
+
+fn dtls13_parseable_client_hello_without_supported_versions(message_seq: u16) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0xFE, 0xFD]); // legacy_version
+    body.extend_from_slice(&[0u8; 32]); // random
+    body.push(0); // session_id_length = 0
+    body.push(0); // cookie_length = 0
+    body.extend_from_slice(&2u16.to_be_bytes()); // cipher_suites_length
+    body.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
+    body.push(1); // compression_methods_length
+    body.push(0); // null compression
+
+    let mut handshake = Vec::new();
+    let len = body.len() as u32;
+    handshake.push(0x01); // ClientHello
+    handshake.extend_from_slice(&len.to_be_bytes()[1..]);
+    handshake.extend_from_slice(&message_seq.to_be_bytes());
+    handshake.extend_from_slice(&0u32.to_be_bytes()[1..]); // fragment_offset
+    handshake.extend_from_slice(&len.to_be_bytes()[1..]); // fragment_length
+    handshake.extend_from_slice(&body);
+
+    let mut packet = Vec::new();
+    packet.push(0x16); // Handshake
+    packet.extend_from_slice(&[0xFE, 0xFD]); // DTLS 1.2 legacy record version
+    packet.extend_from_slice(&0u16.to_be_bytes()); // epoch
+    packet.extend_from_slice(&[0u8; 6]); // sequence
+    packet.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+    packet.extend_from_slice(&handshake);
+    packet
+}
+
 // ============================================================================
 // Auto server + explicit DTLS 1.3 client → DTLS 1.3 (no fallback)
 // ============================================================================
@@ -216,6 +284,161 @@ fn auto_server_with_dtls12_client_no_cookie() {
     assert!(sc, "Server should connect");
     assert_eq!(cv, Some(ProtocolVersion::DTLS1_2));
     assert_eq!(sv, Some(ProtocolVersion::DTLS1_2));
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
+fn auto_server_fallback_ignores_prehandshake_dtls13_ciphertext_poison() {
+    use dimpl::certificate::generate_self_signed_certificate;
+
+    let _ = env_logger::try_init();
+
+    let client_cert = generate_self_signed_certificate().unwrap();
+    let server_cert = generate_self_signed_certificate().unwrap();
+    let client_config = default_config();
+    let server_config = no_cookie_config();
+
+    let mut client = Dtls::new_12(client_config, client_cert, Instant::now());
+    client.set_active(true);
+
+    let mut server = Dtls::new_auto(server_config, server_cert, Instant::now());
+
+    server
+        .handle_packet(&dtls13_future_epoch_ciphertext(0))
+        .expect("auto server should ignore pre-handshake ciphertext poison");
+
+    let (cc, sc, cv, sv) = run_handshake(&mut client, &mut server);
+
+    assert!(cc, "Client should connect");
+    assert!(sc, "Server should connect");
+    assert_eq!(cv, Some(ProtocolVersion::DTLS1_2));
+    assert_eq!(sv, Some(ProtocolVersion::DTLS1_2));
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
+fn auto_server_fallback_replays_sanitized_dtls12_client_hello() {
+    use dimpl::certificate::generate_self_signed_certificate;
+
+    let _ = env_logger::try_init();
+
+    let client_cert = generate_self_signed_certificate().unwrap();
+    let server_cert = generate_self_signed_certificate().unwrap();
+    let client_config = default_config();
+    let server_config = no_cookie_config();
+
+    let now = Instant::now();
+    let mut client = Dtls::new_12(client_config, client_cert, now);
+    client.set_active(true);
+
+    let mut server = Dtls::new_auto(server_config, server_cert, now);
+
+    client.handle_timeout(now).expect("client timeout");
+    let client_hello = collect_packets(&mut client);
+    assert!(!client_hello.is_empty(), "client should emit ClientHello");
+
+    let mut mixed = dtls13_future_epoch_ciphertext(0);
+    mixed.extend_from_slice(&client_hello[0]);
+    server
+        .handle_packet(&mixed)
+        .expect("auto server should ignore poison and fallback on ClientHello");
+
+    let (cc, sc, cv, sv) = run_handshake(&mut client, &mut server);
+
+    assert!(cc, "Client should connect");
+    assert!(sc, "Server should connect");
+    assert_eq!(cv, Some(ProtocolVersion::DTLS1_2));
+    assert_eq!(sv, Some(ProtocolVersion::DTLS1_2));
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
+fn auto_server_malformed_packet_after_dtls13_hrr_does_not_force_fallback() {
+    use dimpl::certificate::generate_self_signed_certificate;
+
+    let _ = env_logger::try_init();
+
+    let client_cert = generate_self_signed_certificate().unwrap();
+    let server_cert = generate_self_signed_certificate().unwrap();
+    let config = default_config();
+
+    let now = Instant::now();
+    let mut client = Dtls::new_13(Arc::clone(&config), client_cert, now);
+    client.set_active(true);
+
+    let mut server = Dtls::new_auto(config, server_cert, now);
+
+    client.handle_timeout(now).expect("client timeout");
+    let client_hello = collect_packets(&mut client);
+    assert!(!client_hello.is_empty(), "client should emit ClientHello");
+
+    for packet in &client_hello {
+        server
+            .handle_packet(packet)
+            .expect("server accepts ClientHello");
+    }
+
+    assert_eq!(
+        server.protocol_version(),
+        None,
+        "server should still be in auto mode after HelloRetryRequest"
+    );
+
+    let _ = drain_outputs(&mut server);
+
+    for packet in client_hello.iter().cycle().take(70) {
+        server
+            .handle_packet(packet)
+            .expect("stale pre-HRR ClientHello retransmit should not poison retained fallback");
+        let _ = drain_outputs(&mut server);
+    }
+
+    assert_eq!(
+        server.protocol_version(),
+        None,
+        "repeated stale ClientHello retransmits must not force or poison fallback"
+    );
+
+    let err = server
+        .handle_packet(&[0x2e, 0x00])
+        .expect_err("malformed junk should not force fallback");
+
+    assert!(
+        matches!(err, Error::ParseIncomplete),
+        "expected ParseIncomplete, got {err:?}"
+    );
+    assert_eq!(
+        server.protocol_version(),
+        None,
+        "stale retained ClientHello must not force DTLS 1.2 fallback"
+    );
+
+    let err = server
+        .handle_packet(&ch_shaped_malformed_packet_with_message_seq(1))
+        .expect_err("post-HRR malformed ClientHello must not force fallback");
+    assert!(
+        matches!(err, Error::ParseError(_)),
+        "expected ParseError, got {err:?}"
+    );
+    assert_eq!(
+        server.protocol_version(),
+        None,
+        "stale retained ClientHello must not force DTLS 1.2 fallback on CH-shaped junk"
+    );
+
+    let err = server
+        .handle_packet(&dtls13_parseable_client_hello_without_supported_versions(1))
+        .expect_err("post-HRR ClientHello without supported_versions must not force fallback");
+
+    assert!(
+        matches!(err, Error::SecurityError(_)),
+        "expected SecurityError, got {err:?}"
+    );
+    assert_eq!(
+        server.protocol_version(),
+        None,
+        "post-HRR ClientHello without DTLS 1.3 must not force DTLS 1.2 fallback"
+    );
 }
 
 // ============================================================================

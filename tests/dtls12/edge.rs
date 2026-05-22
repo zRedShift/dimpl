@@ -62,6 +62,292 @@ fn dtls12_aead_overhead(suite: Dtls12CipherSuite) -> usize {
     }
 }
 
+fn dtls12_future_epoch_app_data(seq: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(23); // ApplicationData
+    out.extend_from_slice(&[0xFE, 0xFD]); // DTLS 1.2
+    out.extend_from_slice(&1u16.to_be_bytes()); // epoch 1, before keys exist
+    out.extend_from_slice(&seq.to_be_bytes()[2..]); // u48 sequence number
+    out.extend_from_slice(&0u16.to_be_bytes()); // empty payload
+    out
+}
+
+fn dtls12_change_cipher_spec_record(seq: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(20); // ChangeCipherSpec
+    out.extend_from_slice(&[0xFE, 0xFD]); // DTLS 1.2
+    out.extend_from_slice(&0u16.to_be_bytes()); // epoch 0
+    out.extend_from_slice(&seq.to_be_bytes()[2..]); // u48 sequence number
+    out.extend_from_slice(&1u16.to_be_bytes()); // payload length
+    out.push(1); // change_cipher_spec
+    out
+}
+
+fn dtls12_bogus_then_client_hello_record(seq: u64, client_hello_packet: &[u8]) -> Vec<u8> {
+    let client_hello_body = &client_hello_packet[13..];
+    let mut body = Vec::new();
+    body.push(0xff); // unknown handshake type
+    body.extend_from_slice(&0u32.to_be_bytes()[1..]); // length
+    body.extend_from_slice(&0u16.to_be_bytes()); // message_seq
+    body.extend_from_slice(&0u32.to_be_bytes()[1..]); // fragment_offset
+    body.extend_from_slice(&0u32.to_be_bytes()[1..]); // fragment_length
+    body.extend_from_slice(client_hello_body);
+
+    let mut out = Vec::new();
+    out.push(22); // Handshake
+    out.extend_from_slice(&[0xFE, 0xFD]); // DTLS 1.2
+    out.extend_from_slice(&0u16.to_be_bytes()); // epoch 0
+    out.extend_from_slice(&seq.to_be_bytes()[2..]); // u48 sequence number
+    out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
+fn dtls12_prehandshake_future_epoch_records_do_not_block_client_hello() {
+    let _ = env_logger::try_init();
+
+    let client_cert = generate_self_signed_certificate().expect("gen client cert");
+    let server_cert = generate_self_signed_certificate().expect("gen server cert");
+    let config = Arc::new(
+        Config::builder()
+            .max_queue_rx(1)
+            .build()
+            .expect("build config"),
+    );
+
+    let now = Instant::now();
+
+    let mut client = Dtls::new_12(Arc::clone(&config), client_cert, now);
+    client.set_active(true);
+
+    let mut server = Dtls::new_12(config, server_cert, now);
+    server.set_active(false);
+
+    server
+        .handle_packet(&dtls12_future_epoch_app_data(0))
+        .expect("pre-handshake future-epoch record should be tolerated");
+
+    client.handle_timeout(now).expect("client timeout");
+    let f1 = collect_packets(&mut client);
+    assert!(!f1.is_empty(), "client should emit ClientHello");
+
+    for p in &f1 {
+        server
+            .handle_packet(p)
+            .expect("future-epoch record must not block ClientHello");
+    }
+
+    server.handle_timeout(now).expect("server timeout");
+    let server_out = collect_packets(&mut server);
+    assert!(
+        !server_out.is_empty(),
+        "server should respond after ClientHello"
+    );
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
+fn dtls12_prehandshake_plaintext_non_client_hello_records_do_not_block_client_hello() {
+    let _ = env_logger::try_init();
+
+    let client_cert = generate_self_signed_certificate().expect("gen client cert");
+    let server_cert = generate_self_signed_certificate().expect("gen server cert");
+    let config = Arc::new(
+        Config::builder()
+            .max_queue_rx(1)
+            .build()
+            .expect("build config"),
+    );
+
+    let now = Instant::now();
+
+    let mut client = Dtls::new_12(Arc::clone(&config), client_cert, now);
+    client.set_active(true);
+
+    let mut server = Dtls::new_12(config, server_cert, now);
+    server.set_active(false);
+
+    server
+        .handle_packet(&dtls12_change_cipher_spec_record(0))
+        .expect("pre-handshake CCS should not occupy receive queue");
+
+    client.handle_timeout(now).expect("client timeout");
+    let f1 = collect_packets(&mut client);
+    assert!(!f1.is_empty(), "client should emit ClientHello");
+
+    for p in &f1 {
+        server
+            .handle_packet(p)
+            .expect("plaintext non-ClientHello record must not block ClientHello");
+    }
+
+    server.handle_timeout(now).expect("server timeout");
+    let server_out = collect_packets(&mut server);
+    assert!(
+        !server_out.is_empty(),
+        "server should respond after ClientHello"
+    );
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
+fn dtls12_prehandshake_record_with_bogus_first_handshake_does_not_block_client_hello() {
+    let _ = env_logger::try_init();
+
+    let client_cert = generate_self_signed_certificate().expect("gen client cert");
+    let server_cert = generate_self_signed_certificate().expect("gen server cert");
+    let config = Arc::new(
+        Config::builder()
+            .max_queue_rx(1)
+            .build()
+            .expect("build config"),
+    );
+
+    let now = Instant::now();
+
+    let mut client = Dtls::new_12(Arc::clone(&config), client_cert, now);
+    client.set_active(true);
+
+    let mut server = Dtls::new_12(config, server_cert, now);
+    server.set_active(false);
+
+    client.handle_timeout(now).expect("client timeout");
+    let f1 = collect_packets(&mut client);
+    assert!(!f1.is_empty(), "client should emit ClientHello");
+
+    server
+        .handle_packet(&dtls12_bogus_then_client_hello_record(0, &f1[0]))
+        .expect("bogus-first mixed handshake should not occupy receive queue");
+
+    for p in &f1 {
+        server
+            .handle_packet(p)
+            .expect("bogus-first mixed handshake must not block clean ClientHello");
+    }
+
+    server.handle_timeout(now).expect("server timeout");
+    let server_out = collect_packets(&mut server);
+    assert!(
+        !server_out.is_empty(),
+        "server should respond after clean ClientHello"
+    );
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
+fn dtls12_prehandshake_mixed_future_epoch_record_does_not_block_client_hello() {
+    let _ = env_logger::try_init();
+
+    let client_cert = generate_self_signed_certificate().expect("gen client cert");
+    let server_cert = generate_self_signed_certificate().expect("gen server cert");
+    let config = Arc::new(
+        Config::builder()
+            .max_queue_rx(1)
+            .build()
+            .expect("build config"),
+    );
+
+    let now = Instant::now();
+
+    let mut client = Dtls::new_12(Arc::clone(&config), client_cert, now);
+    client.set_active(true);
+
+    let mut server = Dtls::new_12(config, server_cert, now);
+    server.set_active(false);
+
+    let mut poison = dtls12_alert_record(0, 1, 0);
+    poison.extend_from_slice(&dtls12_future_epoch_app_data(0));
+    server
+        .handle_packet(&poison)
+        .expect("mixed pre-handshake future-epoch record should be tolerated");
+
+    client.handle_timeout(now).expect("client timeout");
+    let f1 = collect_packets(&mut client);
+    assert!(!f1.is_empty(), "client should emit ClientHello");
+
+    for p in &f1 {
+        server
+            .handle_packet(p)
+            .expect("mixed future-epoch record must not block ClientHello");
+    }
+
+    server.handle_timeout(now).expect("server timeout");
+    let server_out = collect_packets(&mut server);
+    assert!(
+        !server_out.is_empty(),
+        "server should respond after ClientHello"
+    );
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
+fn dtls12_prehandshake_future_epoch_record_before_client_hello_is_filtered() {
+    let _ = env_logger::try_init();
+
+    let client_cert = generate_self_signed_certificate().expect("gen client cert");
+    let server_cert = generate_self_signed_certificate().expect("gen server cert");
+    let config = Arc::new(
+        Config::builder()
+            .max_queue_rx(1)
+            .build()
+            .expect("build config"),
+    );
+
+    let now = Instant::now();
+
+    let mut client = Dtls::new_12(Arc::clone(&config), client_cert, now);
+    client.set_active(true);
+
+    let mut server = Dtls::new_12(config, server_cert, now);
+    server.set_active(false);
+
+    client.handle_timeout(now).expect("client timeout");
+    let f1 = collect_packets(&mut client);
+    assert!(!f1.is_empty(), "client should emit ClientHello");
+
+    let mut mixed = dtls12_future_epoch_app_data(0);
+    mixed.extend_from_slice(&f1[0]);
+    server
+        .handle_packet(&mixed)
+        .expect("future-epoch record must not discard trailing ClientHello");
+
+    server.handle_timeout(now).expect("server timeout");
+    let server_out = collect_packets(&mut server);
+    assert!(
+        !server_out.is_empty(),
+        "server should respond to trailing ClientHello"
+    );
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
+fn dtls12_prehandshake_too_many_filtered_records_still_fail() {
+    let _ = env_logger::try_init();
+
+    let server_cert = generate_self_signed_certificate().expect("gen server cert");
+    let config = dtls12_config();
+    let now = Instant::now();
+
+    let mut server = Dtls::new_12(config, server_cert, now);
+    server.set_active(false);
+
+    let mut packet = Vec::new();
+    for seq in 1..=9 {
+        packet.extend_from_slice(&dtls12_future_epoch_app_data(seq));
+    }
+
+    let err = server
+        .handle_packet(&packet)
+        .expect_err("filtered future-epoch records should still trip TooManyRecords");
+
+    assert!(
+        matches!(err, dimpl::Error::TooManyRecords),
+        "expected TooManyRecords, got {err:?}"
+    );
+}
+
 #[test]
 #[cfg(feature = "rcgen")]
 fn dtls12_malformed_datagram_does_not_process_alerts_before_parse_completes() {

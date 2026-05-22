@@ -61,6 +61,10 @@ pub struct Engine {
     /// Queue of incoming packets.
     queue_rx: QueueRx,
 
+    /// Queueable records from the last parsed datagram, rebuilt after
+    /// parser-side filtering and classification.
+    last_parse_queueable_packet: Option<Buf>,
+
     /// Queue of outgoing packets.
     queue_tx: QueueTx,
 
@@ -226,6 +230,7 @@ impl Engine {
             buffers_free: BufferPool::default(),
             sequence_epoch_0: Sequence::new(0),
             queue_rx: QueueRx::new(),
+            last_parse_queueable_packet: None,
             queue_tx: QueueTx::new(),
             cipher_suite: None,
             hs_send_keys: None,
@@ -338,11 +343,47 @@ impl Engine {
     pub fn parse_packet(&mut self, packet: &[u8]) -> Result<(), Error> {
         let cs = self.cipher_suite;
         let incoming = Incoming::parse_packet(packet, self, cs)?;
+        self.last_parse_queueable_packet = None;
         if let Some(incoming) = incoming {
+            let queueable_packet = incoming
+                .first()
+                .first_handshake()
+                .is_some()
+                .then(|| incoming.to_datagram_buf());
             self.insert_incoming(incoming)?;
+            self.last_parse_queueable_packet = queueable_packet;
         }
 
         Ok(())
+    }
+
+    pub(crate) fn parse_packet_filtering_records(
+        &mut self,
+        packet: &[u8],
+        keep_record: impl FnMut(&Record) -> bool,
+    ) -> Result<(), Error> {
+        let cs = self.cipher_suite;
+        let incoming = Incoming::parse_packet_filtering_records(packet, self, cs, keep_record)?;
+        self.last_parse_queueable_packet = None;
+        if let Some(incoming) = incoming {
+            let queueable_packet = incoming
+                .first()
+                .first_handshake()
+                .is_some()
+                .then(|| incoming.to_datagram_buf());
+            self.insert_incoming(incoming)?;
+            self.last_parse_queueable_packet = queueable_packet;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn take_last_parse_queueable_packet(&mut self) -> Option<Buf> {
+        self.last_parse_queueable_packet.take()
+    }
+
+    pub(crate) fn clear_last_parse_queueable_packet(&mut self) {
+        self.last_parse_queueable_packet = None;
     }
 
     fn insert_incoming(&mut self, incoming: Incoming) -> Result<(), Error> {

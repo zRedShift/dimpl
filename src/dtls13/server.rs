@@ -47,6 +47,7 @@ use crate::dtls13::message::CompressionMethod;
 use crate::dtls13::message::ContentType;
 use crate::dtls13::message::DistinguishedName;
 use crate::dtls13::message::Dtls13CipherSuite;
+use crate::dtls13::message::Dtls13Record;
 use crate::dtls13::message::Extension;
 use crate::dtls13::message::ExtensionType;
 use crate::dtls13::message::KeyShareClientHello;
@@ -221,6 +222,25 @@ impl Server {
         self.auto_mode
     }
 
+    pub(crate) fn can_fallback_to_dtls12(&self) -> bool {
+        self.auto_mode && !self.hello_retry
+    }
+
+    pub(crate) fn retained_packet_count(&self) -> usize {
+        self.retained_hello.len()
+    }
+
+    pub(crate) fn any_retained_packet_from(
+        &self,
+        start: usize,
+        mut predicate: impl FnMut(&[u8]) -> bool,
+    ) -> bool {
+        self.retained_hello
+            .iter()
+            .skip(start)
+            .any(|packet| predicate(packet.as_ref()))
+    }
+
     /// Take all relevant config from this server instance.
     ///
     /// This is used in two cases:
@@ -237,18 +257,43 @@ impl Server {
     }
 
     pub fn handle_packet(&mut self, packet: &[u8]) -> Result<(), Error> {
-        // In auto-sense mode, buffer raw packets while still waiting for
+        if self.state == State::AwaitClientHello {
+            match self
+                .engine
+                .parse_packet_filtering_records(packet, |record| {
+                    !Dtls13Record::is_ciphertext_header(record.buffer()[0])
+                        && (record.record().content_type == ContentType::Alert
+                            || (record.record().content_type == ContentType::Handshake
+                                && record.first_handshake().is_some_and(|h| {
+                                    h.header.msg_type == MessageType::ClientHello
+                                })))
+                }) {
+                Ok(()) => {}
+                Err(e) => {
+                    self.engine.clear_last_parse_queueable_packet();
+                    return Err(e);
+                }
+            }
+        } else {
+            self.engine.parse_packet(packet)?;
+        }
+
+        // In auto-sense mode, buffer sanitized packets while still waiting for
         // the ClientHello so they can be replayed to Server12 on fallback.
-        if self.auto_mode && self.state == State::AwaitClientHello {
+        if self.can_fallback_to_dtls12() && self.state == State::AwaitClientHello {
             // Cap buffered fragments to prevent unbounded growth from malicious traffic
             if self.retained_hello.len() >= MAX_RETAINED_CLIENT_HELLO {
                 return Err(Error::TooManyClientHelloFragments);
             }
-            self.retained_hello.push_back(packet.to_buf());
+            if let Some(packet) = self.engine.take_last_parse_queueable_packet() {
+                self.retained_hello.push_back(packet);
+            }
         }
-
-        self.engine.parse_packet(packet)?;
         self.make_progress()?;
+
+        if self.auto_mode && !self.can_fallback_to_dtls12() {
+            self.retained_hello.clear();
+        }
 
         // Once past AwaitClientHello, DTLS 1.3 is committed — free the buffer.
         if self.auto_mode && self.state != State::AwaitClientHello {
@@ -483,7 +528,7 @@ impl State {
         }
 
         if !supported_versions_ok {
-            if server.auto_mode {
+            if server.auto_mode && !server.hello_retry {
                 return Err(Error::Dtls12Fallback);
             }
             return Err(Error::SecurityError(

@@ -59,6 +59,26 @@ impl Incoming {
 
         Ok(Some(Incoming { records }))
     }
+
+    pub(crate) fn parse_packet_filtering_records(
+        packet: &[u8],
+        decrypt: &mut dyn RecordHandler,
+        cs: Option<Dtls12CipherSuite>,
+        keep_record: impl FnMut(&Record) -> bool,
+    ) -> Result<Option<Self>, Error> {
+        // Parse records directly from packet, copying each record ONCE into its own buffer
+        let records = Records::parse_filtering_records(packet, decrypt, cs, keep_record)?;
+
+        // We need at least one Record to be valid. For replayed frames, we discard
+        // the records, hence this might be None
+        if records.records.is_empty() {
+            return Ok(None);
+        }
+
+        let records = Box::new(records);
+
+        Ok(Some(Incoming { records }))
+    }
 }
 
 /// A number of records parsed from a single UDP packet.
@@ -68,14 +88,24 @@ pub struct Records {
 }
 
 impl Records {
-    fn parse(
+    pub fn parse(
+        packet: &[u8],
+        decrypt: &mut dyn RecordHandler,
+        cs: Option<Dtls12CipherSuite>,
+    ) -> Result<Records, Error> {
+        Self::parse_filtering_records(packet, decrypt, cs, |_| true)
+    }
+
+    fn parse_filtering_records(
         mut packet: &[u8],
         decrypt: &mut dyn RecordHandler,
         cs: Option<Dtls12CipherSuite>,
+        mut keep_record: impl FnMut(&Record) -> bool,
     ) -> Result<Records, Error> {
         let mut parsed_records: ArrayVec<Record, 8> = ArrayVec::new();
         let mut replay_updates: ArrayVec<Sequence, 8> = ArrayVec::new();
         let mut pending_replay = ReplayWindow::new();
+        let mut parsed_record_count = 0usize;
 
         // Find record boundaries and copy each record ONCE from the packet
         while !packet.is_empty() {
@@ -104,7 +134,14 @@ impl Records {
                     }
 
                     if let Some(record) = parsed.record {
-                        if parsed_records.try_push(record).is_err() {
+                        if parsed_record_count >= parsed_records.capacity() {
+                            return Err(Error::TooManyRecords);
+                        }
+                        parsed_record_count += 1;
+
+                        if !keep_record(&record) {
+                            trace!("Discarding filtered rec");
+                        } else if parsed_records.try_push(record).is_err() {
                             return Err(Error::TooManyRecords);
                         }
                     } else if parsed.replay_sequence.is_none() {
