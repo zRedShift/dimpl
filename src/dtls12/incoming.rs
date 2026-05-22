@@ -276,7 +276,17 @@ impl Record {
             let mut buffer = TmpBuf::new(ciphertext);
 
             // This decrypts in place.
-            decrypt.decrypt_data(&mut buffer, aad, nonce)?;
+            if let Err(e) = decrypt.decrypt_data(&mut buffer, aad, nonce) {
+                if !decrypt.can_discard_bad_protected_record() {
+                    return Err(e);
+                }
+
+                trace!("Discarding record: decrypt failed: {}", e);
+                return Ok(RecordParse {
+                    record: None,
+                    replay_sequence: None,
+                });
+            }
 
             buffer.len()
         };
@@ -389,6 +399,10 @@ pub trait RecordHandler {
         aad: Aad,
         nonce: Nonce,
     ) -> Result<(), Error>;
+
+    fn can_discard_bad_protected_record(&self) -> bool {
+        false
+    }
 }
 
 fn parse_handshakes(
