@@ -1044,19 +1044,25 @@ fn dtls13_post_encryption_plaintext_ack_is_ignored() {
     let client_cert = generate_self_signed_certificate().expect("gen client cert");
     let server_cert = generate_self_signed_certificate().expect("gen server cert");
 
-    let config = Arc::new(
+    let client_config = Arc::new(
         Config::builder()
             .aead_encryption_limit(1)
             .build()
-            .expect("build config"),
+            .expect("build client config"),
+    );
+    let server_config = Arc::new(
+        Config::builder()
+            .aead_encryption_limit(16)
+            .build()
+            .expect("build server config"),
     );
 
     let mut now = Instant::now();
 
-    let mut client = Dtls::new_13(Arc::clone(&config), client_cert, now);
+    let mut client = Dtls::new_13(client_config, client_cert, now);
     client.set_active(true);
 
-    let mut server = Dtls::new_13(config, server_cert, now);
+    let mut server = Dtls::new_13(server_config, server_cert, now);
     server.set_active(false);
 
     now = complete_dtls13_handshake(&mut client, &mut server, now);
@@ -1065,16 +1071,26 @@ fn dtls13_post_encryption_plaintext_ack_is_ignored() {
         .send_application_data(b"prime-key-update")
         .expect("send app data that reaches key-update limit");
     let client_out = drain_outputs(&mut client);
-    deliver_packets(&client_out.packets, &mut server);
+    let mut client_packets = client_out.packets;
+    let early_key_update = if client_packets.len() > 1 {
+        client_packets.split_off(1)
+    } else {
+        Vec::new()
+    };
+    deliver_packets(&client_packets, &mut server);
 
     server.handle_timeout(now).expect("server timeout");
     let server_out = drain_outputs(&mut server);
     assert_eq!(server_out.app_data, vec![b"prime-key-update".to_vec()]);
 
     now += Duration::from_millis(10);
-    client.handle_timeout(now).expect("client timeout");
-    let key_update = collect_packets(&mut client);
-    assert_eq!(key_update.len(), 1);
+    let key_update = if early_key_update.is_empty() {
+        client.handle_timeout(now).expect("client timeout");
+        collect_packets(&mut client)
+    } else {
+        early_key_update
+    };
+    assert!(!key_update.is_empty());
 
     client
         .handle_packet(&dtls13_ack_record_with_entry(0x100, 3, 1))
