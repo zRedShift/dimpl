@@ -1,7 +1,10 @@
+use std::collections::VecDeque;
 use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
+
+use arrayvec::ArrayVec;
 
 use super::queue::{QueueRx, QueueTx};
 use crate::buffer::{Buf, BufferPool, TmpBuf};
@@ -15,6 +18,7 @@ use crate::window::ReplayWindow;
 use crate::{Config, Error, Output, SeededRng};
 
 const MAX_DEFRAGMENT_PACKETS: usize = 50;
+const MAX_PRE_KEY_CANDIDATES_PER_SEQUENCE: usize = 2;
 
 enum PollBuffer<'a> {
     Ready(&'a [u8]),
@@ -230,8 +234,14 @@ impl Engine {
 
     /// Insert a parsed datagram into the receive queue.
     fn insert_incoming(&mut self, incoming: Incoming) -> Result<(), Error> {
-        // Capacity guard before iterating records.
-        if self.queue_rx.len() >= self.config.max_queue_rx() {
+        if self.queue_rx.len() >= self.config.max_queue_rx()
+            && (incoming.first().first_handshake().is_some() || self.peer_encryption_enabled)
+        {
+            if self.can_merge_incoming_record_count(incoming.records().len()) {
+                self.merge_incoming_into_existing(incoming, false)?;
+                return Ok(());
+            }
+
             warn!(
                 "Receive queue full (max {}): {:?}",
                 self.config.max_queue_rx(),
@@ -325,6 +335,14 @@ impl Engine {
             return Ok(());
         }
 
+        if self.queue_rx.len() >= self.config.max_queue_rx()
+            && self.is_full_queue_priority_non_handshake(first)
+            && self.can_merge_incoming_record_count(incoming.records().len())
+        {
+            self.merge_incoming_into_existing(incoming, true)?;
+            return Ok(());
+        }
+
         if self.peer_encryption_enabled {
             for record in incoming.records().iter() {
                 if record.record().sequence.epoch == 0
@@ -341,21 +359,378 @@ impl Engine {
             }
         }
 
-        let search_result = self
+        if self
             .queue_rx
-            .binary_search_by_key(&seq_current, |item| item.first().record().sequence);
+            .iter()
+            .any(|queued| incoming_records_equal(queued, &incoming))
+        {
+            return Ok(());
+        }
 
-        match search_result {
-            Err(index) => self.queue_rx.insert(index, incoming),
-            Ok(_) => {
-                // For epoch 0, we can get duplicates due to resends.
-                // For epoch 1, we have the replay window and there should
-                // be no duplicates.
-                assert_eq!(seq_current.epoch, 0);
+        if self.queue_rx.len() >= self.config.max_queue_rx() {
+            self.ensure_full_queue_can_accept_non_handshake(&incoming)?;
+        }
+
+        let mut pending = ArrayVec::new();
+        for record in incoming.into_records() {
+            self.insert_or_stage_non_handshake_record(record, &mut pending)?;
+        }
+
+        if let Some(incoming) = Incoming::from_records(pending) {
+            if self.queue_rx.len() >= self.config.max_queue_rx() {
+                warn!(
+                    "Receive queue full (max {}): {:?}",
+                    self.config.max_queue_rx(),
+                    self.queue_rx
+                );
+                return Err(Error::ReceiveQueueFull);
+            }
+
+            self.insert_non_handshake_sorted(incoming);
+        }
+
+        Ok(())
+    }
+
+    fn can_merge_incoming_record_count(&self, count: usize) -> bool {
+        self.queue_rx
+            .iter()
+            .any(|queued| queued.records().len() + count <= queued.records().capacity())
+    }
+
+    fn is_full_queue_priority_non_handshake(&self, record: &Record) -> bool {
+        let dtls = record.record();
+        dtls.content_type == ContentType::ChangeCipherSpec
+            || (!self.peer_encryption_enabled
+                && dtls.content_type == ContentType::Handshake
+                && dtls.sequence.epoch == 1)
+    }
+
+    fn merge_incoming_into_existing(
+        &mut self,
+        incoming: Incoming,
+        prepend: bool,
+    ) -> Result<(), Error> {
+        let count = incoming.records().len();
+        let Some(index) = self
+            .queue_rx
+            .iter()
+            .position(|queued| queued.records().len() + count <= queued.records().capacity())
+        else {
+            warn!(
+                "Receive queue full (max {}): cannot merge priority record",
+                self.config.max_queue_rx()
+            );
+            return Err(Error::ReceiveQueueFull);
+        };
+
+        let queued = self
+            .queue_rx
+            .remove(index)
+            .expect("merge index was selected from queue_rx");
+        let mut records = ArrayVec::new();
+
+        if prepend {
+            for record in incoming.into_records() {
+                records
+                    .try_push(record)
+                    .map_err(|_| Error::TooManyRecords)?;
+            }
+            for record in queued.into_records() {
+                records
+                    .try_push(record)
+                    .map_err(|_| Error::TooManyRecords)?;
+            }
+        } else {
+            for record in queued.into_records() {
+                records
+                    .try_push(record)
+                    .map_err(|_| Error::TooManyRecords)?;
+            }
+            for record in incoming.into_records() {
+                records
+                    .try_push(record)
+                    .map_err(|_| Error::TooManyRecords)?;
+            }
+        }
+
+        let merged = Incoming::from_records(records).expect("incoming contributes records");
+        self.insert_non_handshake_sorted(merged);
+        Ok(())
+    }
+
+    fn ensure_full_queue_can_accept_non_handshake(&self, incoming: &Incoming) -> Result<(), Error> {
+        let mut counts: Vec<(Sequence, usize)> = Vec::new();
+        let mut remaining_capacity: Vec<usize> = self
+            .queue_rx
+            .iter()
+            .map(|queued| queued.records().capacity() - queued.records().len())
+            .collect();
+
+        for (record_index, record) in incoming.records().iter().enumerate() {
+            if record.first_handshake().is_some() {
+                continue;
+            }
+
+            if self.queued_record_equal(record)
+                || incoming.records()[..record_index]
+                    .iter()
+                    .any(|candidate| candidate.buffer() == record.buffer())
+            {
+                continue;
+            }
+
+            let sequence = record.record().sequence;
+            let count_index = match counts.iter().position(|(seq, _)| *seq == sequence) {
+                Some(index) => index,
+                None => {
+                    counts.push((sequence, self.non_handshake_sequence_count(sequence)));
+                    counts.len() - 1
+                }
+            };
+            let count = &mut counts[count_index].1;
+
+            if *count == 0 {
+                warn!(
+                    "Receive queue full (max {}): {:?}",
+                    self.config.max_queue_rx(),
+                    self.queue_rx
+                );
+                return Err(Error::ReceiveQueueFull);
+            }
+
+            if *count < MAX_PRE_KEY_CANDIDATES_PER_SEQUENCE {
+                let Some(index) = self
+                    .queue_rx
+                    .iter()
+                    .enumerate()
+                    .position(|(index, queued)| {
+                        remaining_capacity[index] > 0
+                            && incoming_has_non_handshake_sequence(queued, sequence)
+                    })
+                else {
+                    warn!(
+                        "Receive queue full (max {}): cannot merge same-sequence candidate",
+                        self.config.max_queue_rx()
+                    );
+                    return Err(Error::ReceiveQueueFull);
+                };
+                remaining_capacity[index] -= 1;
+                *count += 1;
             }
         }
 
         Ok(())
+    }
+
+    fn insert_or_stage_non_handshake_record(
+        &mut self,
+        record: Record,
+        pending: &mut ArrayVec<Record, 8>,
+    ) -> Result<(), Error> {
+        if self.queued_or_pending_record_equal(&record, pending) {
+            self.buffers_free.push(record.into_buffer());
+            return Ok(());
+        }
+
+        let sequence = record.record().sequence;
+        let queued_count = self.non_handshake_sequence_count(sequence);
+        let pending_count = pending
+            .iter()
+            .filter(|candidate| non_handshake_sequence_matches(candidate, sequence))
+            .count();
+
+        if queued_count + pending_count >= MAX_PRE_KEY_CANDIDATES_PER_SEQUENCE {
+            if let Some(index) = pending
+                .iter()
+                .rposition(|candidate| non_handshake_sequence_matches(candidate, sequence))
+            {
+                let removed = pending.remove(index);
+                self.buffers_free.push(removed.into_buffer());
+                pending
+                    .try_push(record)
+                    .map_err(|_| Error::TooManyRecords)?;
+            } else {
+                self.replace_newest_non_handshake_sequence_candidate(sequence, record)?;
+            }
+            return Ok(());
+        }
+
+        if queued_count > 0 && self.non_handshake_sequence_merge_index(sequence).is_some() {
+            self.merge_non_handshake_record(sequence, record)?;
+            return Ok(());
+        }
+
+        if self.queue_rx.len() >= self.config.max_queue_rx() {
+            warn!(
+                "Receive queue full (max {}): {:?}",
+                self.config.max_queue_rx(),
+                self.queue_rx
+            );
+            return Err(Error::ReceiveQueueFull);
+        }
+
+        pending
+            .try_push(record)
+            .map_err(|_| Error::TooManyRecords)?;
+        Ok(())
+    }
+
+    fn queued_or_pending_record_equal(
+        &self,
+        record: &Record,
+        pending: &ArrayVec<Record, 8>,
+    ) -> bool {
+        self.queued_record_equal(record)
+            || pending
+                .iter()
+                .any(|queued| queued.buffer() == record.buffer())
+    }
+
+    fn queued_record_equal(&self, record: &Record) -> bool {
+        self.queue_rx
+            .iter()
+            .flat_map(|queued| queued.records().iter())
+            .any(|queued| queued.buffer() == record.buffer())
+    }
+
+    fn non_handshake_sequence_count(&self, sequence: Sequence) -> usize {
+        self.queue_rx
+            .iter()
+            .flat_map(|incoming| incoming.records().iter())
+            .filter(|record| non_handshake_sequence_matches(record, sequence))
+            .count()
+    }
+
+    fn replace_newest_non_handshake_sequence_candidate(
+        &mut self,
+        sequence: Sequence,
+        record: Record,
+    ) -> Result<(), Error> {
+        let Some((incoming_index, record_index)) =
+            self.newest_non_handshake_sequence_record_index(sequence)
+        else {
+            return Err(Error::ReceiveQueueFull);
+        };
+
+        let queued = self
+            .queue_rx
+            .remove(incoming_index)
+            .expect("replacement index was selected from queue_rx");
+        let mut replacement = Some(record);
+        let mut records = ArrayVec::new();
+
+        for (index, queued_record) in queued.into_records().enumerate() {
+            if index == record_index {
+                self.buffers_free.push(queued_record.into_buffer());
+                records
+                    .try_push(replacement.take().expect("replacement used once"))
+                    .map_err(|_| Error::TooManyRecords)?;
+            } else {
+                records
+                    .try_push(queued_record)
+                    .map_err(|_| Error::TooManyRecords)?;
+            }
+        }
+
+        let merged = Incoming::from_records(records).expect("incoming contributes records");
+        self.insert_non_handshake_sorted(merged);
+        Ok(())
+    }
+
+    fn merge_non_handshake_record(
+        &mut self,
+        sequence: Sequence,
+        record: Record,
+    ) -> Result<(), Error> {
+        let Some(index) = self.non_handshake_sequence_merge_index(sequence) else {
+            warn!(
+                "Receive queue full (max {}): cannot merge same-sequence candidate",
+                self.config.max_queue_rx()
+            );
+            return Err(Error::ReceiveQueueFull);
+        };
+
+        let queued = self
+            .queue_rx
+            .remove(index)
+            .expect("merge index was selected from queue_rx");
+        let mut records = ArrayVec::new();
+
+        for queued_record in queued.into_records() {
+            records
+                .try_push(queued_record)
+                .map_err(|_| Error::TooManyRecords)?;
+        }
+        records
+            .try_push(record)
+            .map_err(|_| Error::TooManyRecords)?;
+
+        let merged = Incoming::from_records(records).expect("incoming contributes records");
+        self.insert_non_handshake_sorted(merged);
+        Ok(())
+    }
+
+    fn non_handshake_sequence_merge_index(&self, sequence: Sequence) -> Option<usize> {
+        self.queue_rx.iter().position(|queued| {
+            queued.records().len() < queued.records().capacity()
+                && incoming_has_non_handshake_sequence(queued, sequence)
+        })
+    }
+
+    fn newest_non_handshake_sequence_record_index(
+        &self,
+        sequence: Sequence,
+    ) -> Option<(usize, usize)> {
+        self.newest_non_handshake_sequence_record_index_with_first_sequence(sequence)
+            .or_else(|| {
+                self.queue_rx
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find_map(|(incoming_index, incoming)| {
+                        incoming
+                            .records()
+                            .iter()
+                            .rposition(|record| non_handshake_sequence_matches(record, sequence))
+                            .map(|record_index| (incoming_index, record_index))
+                    })
+            })
+    }
+
+    fn newest_non_handshake_sequence_record_index_with_first_sequence(
+        &self,
+        sequence: Sequence,
+    ) -> Option<(usize, usize)> {
+        self.queue_rx
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, incoming)| incoming.first().record().sequence == sequence)
+            .find_map(|(incoming_index, incoming)| {
+                incoming
+                    .records()
+                    .iter()
+                    .rposition(|record| non_handshake_sequence_matches(record, sequence))
+                    .map(|record_index| (incoming_index, record_index))
+            })
+    }
+
+    fn insert_non_handshake_sorted(&mut self, incoming: Incoming) {
+        let seq_current = incoming.first().record().sequence;
+        let index = self
+            .queue_rx
+            .binary_search_by_key(&seq_current, |item| item.first().record().sequence)
+            .map(|mut index| {
+                while index < self.queue_rx.len()
+                    && self.queue_rx[index].first().record().sequence == seq_current
+                {
+                    index += 1;
+                }
+                index
+            })
+            .unwrap_or_else(|index| index);
+        self.queue_rx.insert(index, incoming);
     }
 
     pub fn handle_timeout(&mut self, now: Instant) -> Result<(), Error> {
@@ -438,29 +813,34 @@ impl Engine {
             return PollBuffer::Empty(buf);
         }
 
-        let mut unhandled = self
+        let unhandled = self
             .queue_rx
             .iter()
             .flat_map(|i| i.records().iter())
             .filter(|r| r.record().content_type == ContentType::ApplicationData)
-            .skip_while(|r| r.is_handled());
+            .filter(|r| !r.is_handled());
 
-        let Some(next) = unhandled.next() else {
-            return PollBuffer::Empty(buf);
-        };
+        for next in unhandled {
+            if !self.peer_encryption_enabled || next.record().sequence.epoch != 1 {
+                next.set_handled();
+                continue;
+            }
 
-        let record_buffer = next.buffer();
-        let fragment = next.record().fragment(record_buffer);
-        let len = fragment.len();
+            let record_buffer = next.buffer();
+            let fragment = next.record().fragment(record_buffer);
+            let len = fragment.len();
 
-        if len > buf.len() {
-            return PollBuffer::TooSmall { needed: len };
+            if len > buf.len() {
+                return PollBuffer::TooSmall { needed: len };
+            }
+
+            buf[..len].copy_from_slice(fragment);
+            next.set_handled();
+
+            return PollBuffer::Ready(&buf[..len]);
         }
 
-        buf[..len].copy_from_slice(fragment);
-        next.set_handled();
-
-        PollBuffer::Ready(&buf[..len])
+        PollBuffer::Empty(buf)
     }
 
     fn purge_handled_queue_rx(&mut self) {
@@ -1123,14 +1503,72 @@ impl Engine {
 
         // Now decrypt all entries remaining.
         let all = self.queue_rx.split_off(index_epoch1);
+        let mut records = Vec::new();
 
         for incoming in all {
-            let unhandled = incoming.into_records().filter(|r| !r.is_handled());
+            for record in incoming.into_records() {
+                if record.is_handled() {
+                    self.buffers_free.push(record.into_buffer());
+                    continue;
+                }
 
-            for record in unhandled {
-                let buf = record.into_buffer();
-                self.parse_packet(&buf)?;
+                if record.record().sequence.epoch == 1 {
+                    records.push((record.record().sequence, record.into_buffer()));
+                } else {
+                    self.buffers_free.push(record.into_buffer());
+                }
+            }
+        }
+        records.sort_by(|(left, _), (right, _)| {
+            (left.epoch, left.sequence_number).cmp(&(right.epoch, right.sequence_number))
+        });
+        let mut records = VecDeque::from(records);
+
+        while let Some((sequence, _)) = records.front() {
+            let sequence = *sequence;
+            let mut first_crypto_error = None;
+            let mut sequence_succeeded = false;
+
+            while records
+                .front()
+                .is_some_and(|(candidate_sequence, _)| *candidate_sequence == sequence)
+            {
+                let (_, buf) = records.pop_front().expect("front checked above");
+
+                if sequence_succeeded {
+                    self.buffers_free.push(buf);
+                    continue;
+                }
+
+                let queue_len_before = self.queue_rx.len();
+                let close_notify_before = self.close_notify_received;
+                let replay_open_before = self.replay.check(sequence.sequence_number);
+
+                match self.parse_packet(&buf) {
+                    Ok(()) => {
+                        let replay_consumed =
+                            replay_open_before && !self.replay.check(sequence.sequence_number);
+                        sequence_succeeded = self.queue_rx.len() > queue_len_before
+                            || self.close_notify_received != close_notify_before
+                            || replay_consumed;
+                    }
+                    Err(e) => {
+                        if matches!(&e, Error::CryptoError(_)) {
+                            first_crypto_error.get_or_insert(e);
+                        } else {
+                            self.buffers_free.push(buf);
+                            return Err(e);
+                        }
+                    }
+                }
+
                 self.buffers_free.push(buf);
+            }
+
+            if !sequence_succeeded {
+                if let Some(error) = first_crypto_error {
+                    return Err(error);
+                }
             }
         }
 
@@ -1203,9 +1641,35 @@ impl Engine {
     }
 }
 
+fn incoming_records_equal(left: &Incoming, right: &Incoming) -> bool {
+    left.records().len() == right.records().len()
+        && left
+            .records()
+            .iter()
+            .zip(right.records().iter())
+            .all(|(left, right)| left.buffer() == right.buffer())
+}
+
+fn incoming_has_non_handshake_sequence(incoming: &Incoming, sequence: Sequence) -> bool {
+    incoming
+        .records()
+        .iter()
+        .any(|record| non_handshake_sequence_matches(record, sequence))
+}
+
+fn non_handshake_sequence_matches(record: &Record, sequence: Sequence) -> bool {
+    record.first_handshake().is_none() && record.record().sequence == sequence
+}
+
 impl RecordHandler for Engine {
     fn classify_record(&mut self, record: Record) -> Result<Option<Record>, Error> {
         let epoch = record.record().sequence.epoch;
+
+        if !self.peer_encryption_enabled && epoch > 0 && (epoch != 1 || self.cipher_suite.is_none())
+        {
+            self.push_buffer(record.into_buffer());
+            return Ok(None);
+        }
 
         if record.record().content_type == ContentType::ChangeCipherSpec
             && epoch == 0
@@ -1266,7 +1730,7 @@ impl RecordHandler for Engine {
             }
 
             if !self.peer_encryption_enabled {
-                // Epoch >= 1 before peer encryption is enabled must stay queued
+                // Epoch 1 before peer encryption is enabled must stay queued
                 // for re-parsing after enable_peer_encryption().
                 return Ok(Some(record));
             }
@@ -1341,5 +1805,247 @@ impl RecordHandler for Engine {
 
     fn can_discard_bad_protected_record(&self) -> bool {
         self.release_app_data
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn future_epoch_app_data(seq: u64, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(ContentType::ApplicationData.as_u8());
+        out.extend_from_slice(&[0xfe, 0xfd]);
+        out.extend_from_slice(&1u16.to_be_bytes());
+        out.extend_from_slice(&seq.to_be_bytes()[2..]);
+        out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn pre_key_engine(max_queue_rx: usize) -> Engine {
+        let config = Arc::new(
+            Config::builder()
+                .max_queue_rx(max_queue_rx)
+                .build()
+                .expect("build config"),
+        );
+        let mut engine = Engine::new(config, AuthMode::Psk);
+        engine.set_cipher_suite(Dtls12CipherSuite::PSK_AES128_CCM_8);
+        engine
+    }
+
+    #[test]
+    fn full_receive_queue_merges_second_same_sequence_candidate_without_growing() {
+        let mut engine = pre_key_engine(1);
+
+        engine
+            .parse_packet(&future_epoch_app_data(0, b"stale"))
+            .expect("first future-epoch candidate should queue");
+        assert_eq!(engine.queue_rx.len(), 1);
+
+        engine
+            .parse_packet(&future_epoch_app_data(0, b"latest"))
+            .expect("same-sequence replacement should not exceed max_queue_rx");
+        assert_eq!(engine.queue_rx.len(), 1);
+        assert_eq!(engine.queue_rx[0].records().len(), 2);
+
+        let records = engine.queue_rx[0].records();
+        assert_eq!(records[0].record().sequence.sequence_number, 0);
+        assert_eq!(records[0].record().fragment(records[0].buffer()), b"stale");
+        assert_eq!(records[1].record().sequence.sequence_number, 0);
+        assert_eq!(records[1].record().fragment(records[1].buffer()), b"latest");
+    }
+
+    #[test]
+    fn full_receive_queue_merges_hidden_same_sequence_candidate() {
+        let mut engine = pre_key_engine(1);
+
+        let mut hidden_stale = future_epoch_app_data(1, b"filler");
+        hidden_stale.extend_from_slice(&future_epoch_app_data(0, b"stale"));
+
+        engine
+            .parse_packet(&hidden_stale)
+            .expect("multi-record future-epoch candidate should queue");
+        assert_eq!(engine.queue_rx.len(), 1);
+
+        engine
+            .parse_packet(&future_epoch_app_data(0, b"latest"))
+            .expect("same-sequence replacement should find non-first records");
+        assert_eq!(engine.queue_rx.len(), 1);
+
+        assert_eq!(engine.queue_rx[0].records().len(), 3);
+        assert_eq!(
+            engine.queue_rx[0].records()[0]
+                .record()
+                .sequence
+                .sequence_number,
+            1
+        );
+        assert_eq!(
+            engine.queue_rx[0].records()[0]
+                .record()
+                .fragment(engine.queue_rx[0].records()[0].buffer()),
+            b"filler"
+        );
+        assert_eq!(
+            engine.queue_rx[0].records()[1]
+                .record()
+                .sequence
+                .sequence_number,
+            0
+        );
+        assert_eq!(
+            engine.queue_rx[0].records()[1]
+                .record()
+                .fragment(engine.queue_rx[0].records()[1].buffer()),
+            b"stale"
+        );
+        assert_eq!(
+            engine.queue_rx[0].records()[2]
+                .record()
+                .sequence
+                .sequence_number,
+            0
+        );
+        assert_eq!(
+            engine.queue_rx[0].records()[2]
+                .record()
+                .fragment(engine.queue_rx[0].records()[2].buffer()),
+            b"latest"
+        );
+    }
+
+    #[test]
+    fn same_datagram_candidate_cap_is_enforced_per_record() {
+        let mut engine = pre_key_engine(2);
+
+        let mut packet = future_epoch_app_data(0, b"first");
+        packet.extend_from_slice(&future_epoch_app_data(0, b"second"));
+        packet.extend_from_slice(&future_epoch_app_data(0, b"third"));
+
+        engine
+            .parse_packet(&packet)
+            .expect("same-sequence candidates should stay bounded per record");
+
+        let candidates: Vec<_> = engine.queue_rx[0]
+            .records()
+            .iter()
+            .filter(|record| record.record().sequence.sequence_number == 0)
+            .map(|record| record.record().fragment(record.buffer()).to_vec())
+            .collect();
+
+        assert_eq!(candidates, vec![b"first".to_vec(), b"third".to_vec()]);
+    }
+
+    #[test]
+    fn same_sequence_candidate_cap_preserves_hidden_oldest_candidate() {
+        let mut engine = pre_key_engine(2);
+
+        let mut hidden_oldest = future_epoch_app_data(1, b"filler");
+        hidden_oldest.extend_from_slice(&future_epoch_app_data(0, b"oldest"));
+
+        engine
+            .parse_packet(&hidden_oldest)
+            .expect("hidden oldest same-sequence candidate should queue");
+        engine
+            .parse_packet(&future_epoch_app_data(0, b"poison1"))
+            .expect("first alternative should queue");
+        engine
+            .parse_packet(&future_epoch_app_data(0, b"poison2"))
+            .expect("second alternative should replace the previous alternative");
+
+        let candidates: Vec<_> = engine
+            .queue_rx
+            .iter()
+            .flat_map(|incoming| incoming.records().iter())
+            .filter(|record| record.record().sequence.sequence_number == 0)
+            .map(|record| record.record().fragment(record.buffer()).to_vec())
+            .collect();
+
+        assert_eq!(candidates, vec![b"oldest".to_vec(), b"poison2".to_vec()]);
+    }
+
+    #[test]
+    fn full_receive_queue_rejects_over_capacity_merge_without_mutating_queue() {
+        let mut engine = pre_key_engine(1);
+
+        let mut full_datagram = future_epoch_app_data(0, b"stale");
+        for seq in 1..8 {
+            full_datagram.extend_from_slice(&future_epoch_app_data(seq, b"filler"));
+        }
+        engine
+            .parse_packet(&full_datagram)
+            .expect("full multi-record future-epoch datagram should queue");
+
+        let original_records: Vec<_> = engine.queue_rx[0]
+            .records()
+            .iter()
+            .map(|record| {
+                (
+                    record.record().sequence.sequence_number,
+                    record.record().fragment(record.buffer()).to_vec(),
+                )
+            })
+            .collect();
+
+        let mut oversized_replacement = future_epoch_app_data(0, b"latest");
+        oversized_replacement.extend_from_slice(&future_epoch_app_data(8, b"extra"));
+        let result = engine.parse_packet(&oversized_replacement);
+
+        assert!(matches!(result, Err(Error::ReceiveQueueFull)));
+        assert_eq!(engine.queue_rx.len(), 1);
+        let current_records: Vec<_> = engine.queue_rx[0]
+            .records()
+            .iter()
+            .map(|record| {
+                (
+                    record.record().sequence.sequence_number,
+                    record.record().fragment(record.buffer()).to_vec(),
+                )
+            })
+            .collect();
+        assert_eq!(current_records, original_records);
+    }
+
+    #[test]
+    fn full_receive_queue_accepts_duplicate_record_at_record_capacity() {
+        let mut engine = pre_key_engine(1);
+
+        let mut full_datagram = future_epoch_app_data(0, b"stale");
+        for seq in 1..8 {
+            full_datagram.extend_from_slice(&future_epoch_app_data(seq, b"filler"));
+        }
+        engine
+            .parse_packet(&full_datagram)
+            .expect("full multi-record future-epoch datagram should queue");
+
+        let original_records: Vec<_> = engine.queue_rx[0]
+            .records()
+            .iter()
+            .map(|record| {
+                (
+                    record.record().sequence.sequence_number,
+                    record.record().fragment(record.buffer()).to_vec(),
+                )
+            })
+            .collect();
+
+        engine
+            .parse_packet(&future_epoch_app_data(0, b"stale"))
+            .expect("duplicate record should be accepted as a no-op even when full");
+
+        assert_eq!(engine.queue_rx.len(), 1);
+        let current_records: Vec<_> = engine.queue_rx[0]
+            .records()
+            .iter()
+            .map(|record| {
+                (
+                    record.record().sequence.sequence_number,
+                    record.record().fragment(record.buffer()).to_vec(),
+                )
+            })
+            .collect();
+        assert_eq!(current_records, original_records);
     }
 }
