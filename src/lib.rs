@@ -303,8 +303,8 @@ fn is_dtls12_psk_only(config: &Config) -> bool {
 /// fragment_offset + fragment_length + body). Returns `None` for any
 /// other content type, message type, or malformed framing.
 ///
-/// Shared by [`looks_like_client_hello`] (structural check only) and
-/// [`client_hello_wants_psk`] (which inspects cipher suites further).
+/// Shared by ClientHello structural tests and [`client_hello_wants_psk`],
+/// which inspects cipher suites further.
 fn client_hello_handshake(packet: &[u8]) -> Option<&[u8]> {
     // DTLS record header: content_type(1) + version(2) + epoch(2) + seq(6) + length(2) = 13
     if packet.len() < 13 || packet[0] != 0x16 {
@@ -323,11 +323,6 @@ fn client_hello_handshake(packet: &[u8]) -> Option<&[u8]> {
 
 /// Lightweight structural check: does this packet look like a ClientHello?
 ///
-/// Used by the auto-sense server to gate the DTLS 1.2 fallback on parse
-/// errors. A packet that fails to parse in the DTLS 1.3 engine should
-/// only trigger a downgrade if it at least claims to be a ClientHello —
-/// otherwise random/garbage traffic could force fallback.
-///
 /// In addition to the record/handshake header check from
 /// [`client_hello_handshake`], this validates wire-format integrity of
 /// the handshake header (fragment fits inside the declared total length;
@@ -336,6 +331,7 @@ fn client_hello_handshake(packet: &[u8]) -> Option<&[u8]> {
 /// minimum a real DTLS 1.2 ClientHello can carry. A header-only fake
 /// or a CH whose declared length cannot fit a valid 1.2 body fails the
 /// check.
+#[cfg(test)]
 fn looks_like_client_hello(packet: &[u8]) -> bool {
     let Some(record_body) = client_hello_handshake(packet) else {
         return false;
@@ -622,45 +618,12 @@ impl Dtls {
         match self.inner.as_mut().unwrap() {
             Inner::ClientPending(_) => self.handle_pending_auto_client(packet),
             Inner::Server13(server) if server.is_auto_mode() => {
-                // Run the structural check unconditionally so the time
-                // spent here does not leak which error branch the parser
-                // took — same cost whether handle_packet returns Ok,
-                // Dtls12Fallback, ParseError, or anything else.
-                let is_ch_shaped = looks_like_client_hello(packet);
-                let retained_count_before = server.retained_packet_count();
                 let can_fallback_to_dtls12 = server.can_fallback_to_dtls12();
                 match server.handle_packet(packet) {
                     Ok(()) => Ok(()),
                     Err(Error::Dtls12Fallback) if can_fallback_to_dtls12 => {
                         // The 1.3 engine cleanly rejected a ClientHello
                         // that did not offer DTLS 1.3 in supported_versions.
-                        self.handle_pending_auto_server()
-                    }
-                    Err(Error::ParseError(nom::error::ErrorKind::LengthValue)) => {
-                        Err(Error::ParseError(nom::error::ErrorKind::LengthValue))
-                    }
-                    Err(Error::ParseError(_) | Error::ParseIncomplete)
-                        if can_fallback_to_dtls12 && is_ch_shaped && retained_count_before == 0 =>
-                    {
-                        // The packet is structurally a ClientHello but the
-                        // 1.3 parser couldn't handle it — fall back to 1.2,
-                        // which has a more permissive parser. Random/garbage
-                        // traffic, and malformed later packets after retained
-                        // pre-HRR state, are not caught here, so an off-path
-                        // attacker cannot force a downgrade by spraying
-                        // malformed packets.
-                        self.handle_pending_auto_server()
-                    }
-                    Err(Error::ParseError(_) | Error::ParseIncomplete)
-                        if can_fallback_to_dtls12
-                            && server.any_retained_packet_from(
-                                retained_count_before,
-                                looks_like_client_hello,
-                            ) =>
-                    {
-                        // The raw datagram may have contained filtered junk
-                        // before a real ClientHello. Gate fallback on the
-                        // sanitized retained records, not the raw packet.
                         self.handle_pending_auto_server()
                     }
                     Err(e) => Err(e),
@@ -1315,15 +1278,15 @@ mod test {
     }
 
     /// CH-shaped body whose `cipher_suites_length` exceeds the bytes that
-    /// follow it — the DTLS 1.3 body parser will error on this. Used to
-    /// drive the auto-server into the gated ParseError fallback path.
+    /// follow it. The structural gate accepts this as ClientHello-shaped, but
+    /// the parser must reject it without forcing auto-sense fallback.
     fn ch_shaped_malformed_body() -> Vec<u8> {
         let mut body = Vec::new();
         body.extend_from_slice(&[0xFE, 0xFD]); // version
         body.extend_from_slice(&[0u8; 32]); // random
         body.push(0); // session_id_length = 0
         body.push(0); // cookie_length = 0
-        body.extend_from_slice(&[0xFF, 0xFF]); // cipher_suites_length = 65535 — bogus
+        body.extend_from_slice(&[0x00, 0x04]); // cipher_suites_length exceeds available suites
         body.extend_from_slice(&[0xC0, 0x2B]); // 2 bytes that pretend to be a suite
         body.push(1); // compression_methods_length = 1
         body.push(0); // null compression
@@ -1331,13 +1294,7 @@ mod test {
     }
 
     #[test]
-    fn auto_server_falls_back_on_ch_shaped_malformed_packet() {
-        // Documents the intentional behavior of the gated fallback: a
-        // packet that is structurally a ClientHello (passes
-        // `looks_like_client_hello`) but whose body cannot be parsed by
-        // the DTLS 1.3 engine should still flip the auto-sense server
-        // into DTLS 1.2 mode. (Random non-CH garbage does not — see
-        // `auto_server_drops_garbage_without_falling_back`.)
+    fn auto_server_rejects_ch_shaped_malformed_packet_without_fallback() {
         let body = ch_shaped_malformed_body();
         let len = body.len() as u32;
         let hs = make_handshake(0x01, len, 0, len, &body);
@@ -1348,15 +1305,18 @@ mod test {
         );
 
         let mut dtls = new_instance_auto();
-        // Server12 will also fail to parse this packet on replay, so
-        // ignore the result of handle_packet — we only care about which
-        // inner state we ended up in.
-        let _ = dtls.handle_packet(&pkt);
-        let fell_back = matches!(dtls.inner, Some(Inner::Server12(_)));
+        let err = dtls
+            .handle_packet(&pkt)
+            .expect_err("malformed ClientHello-shaped packet must not force fallback");
+
         assert!(
-            fell_back,
-            "auto-sense server must fall back to DTLS 1.2 on a CH-shaped malformed packet"
+            matches!(err, Error::ParseIncomplete | Error::ParseError(_)),
+            "expected parser error, got {err:?}"
         );
+        assert!(matches!(
+            dtls.inner,
+            Some(Inner::Server13(ref server)) if server.is_auto_mode()
+        ));
     }
 
     #[test]
