@@ -226,21 +226,6 @@ impl Server {
         self.auto_mode && !self.hello_retry
     }
 
-    pub(crate) fn retained_packet_count(&self) -> usize {
-        self.retained_hello.len()
-    }
-
-    pub(crate) fn any_retained_packet_from(
-        &self,
-        start: usize,
-        mut predicate: impl FnMut(&[u8]) -> bool,
-    ) -> bool {
-        self.retained_hello
-            .iter()
-            .skip(start)
-            .any(|packet| predicate(packet.as_ref()))
-    }
-
     /// Take all relevant config from this server instance.
     ///
     /// This is used in two cases:
