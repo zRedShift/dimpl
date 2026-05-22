@@ -22,6 +22,16 @@ impl Incoming {
         &self.records
     }
 
+    pub(crate) fn from_records(records: ArrayVec<Record, 8>) -> Option<Self> {
+        if records.is_empty() {
+            return None;
+        }
+
+        Some(Incoming {
+            records: Box::new(Records { records }),
+        })
+    }
+
     pub fn first(&self) -> &Record {
         // Invariant: Every Incoming must have at least one Record
         // or the parser of Incoming returns None.
@@ -88,6 +98,10 @@ pub struct Records {
 }
 
 impl Records {
+    pub(crate) fn capacity(&self) -> usize {
+        self.records.capacity()
+    }
+
     pub fn parse(
         packet: &[u8],
         decrypt: &mut dyn RecordHandler,

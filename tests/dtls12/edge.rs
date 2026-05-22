@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "rcgen")]
 use dimpl::certificate::generate_self_signed_certificate;
 use dimpl::crypto::Dtls12CipherSuite;
-use dimpl::{Config, Dtls, Output};
+use dimpl::{Config, Dtls, Error, Output};
 
 use crate::common::*;
 
@@ -62,14 +62,180 @@ fn dtls12_aead_overhead(suite: Dtls12CipherSuite) -> usize {
     }
 }
 
-fn dtls12_future_epoch_app_data(seq: u64) -> Vec<u8> {
+fn dtls12_app_data_record(epoch: u16, seq: u64, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(23); // ApplicationData
     out.extend_from_slice(&[0xFE, 0xFD]); // DTLS 1.2
-    out.extend_from_slice(&1u16.to_be_bytes()); // epoch 1, before keys exist
+    out.extend_from_slice(&epoch.to_be_bytes());
     out.extend_from_slice(&seq.to_be_bytes()[2..]); // u48 sequence number
-    out.extend_from_slice(&0u16.to_be_bytes()); // empty payload
+    out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    out.extend_from_slice(payload);
     out
+}
+
+fn dtls12_future_epoch_app_data(seq: u64) -> Vec<u8> {
+    dtls12_app_data_record(1, seq, &[])
+}
+
+fn dtls12_record_chunks(datagram: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    while offset + 13 <= datagram.len() {
+        let len = u16::from_be_bytes([datagram[offset + 11], datagram[offset + 12]]) as usize;
+        let end = offset + 13 + len;
+        if end > datagram.len() {
+            break;
+        }
+        out.push(datagram[offset..end].to_vec());
+        offset = end;
+    }
+    out
+}
+
+fn dtls12_record_is(record: &[u8], ctype: u8, epoch: u16) -> bool {
+    record.len() >= 5 && record[0] == ctype && u16::from_be_bytes([record[3], record[4]]) == epoch
+}
+
+fn tamper_last_byte(record: &[u8], mask: u8) -> Vec<u8> {
+    let mut tampered = record.to_vec();
+    let last = tampered
+        .last_mut()
+        .expect("encrypted app-data record is non-empty");
+    *last ^= mask;
+    tampered
+}
+
+#[cfg(feature = "rcgen")]
+fn dtls12_client_with_early_server_app_data(app_data: &[u8]) -> (Dtls, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    dtls12_client_with_early_server_app_data_config(&[app_data], dtls12_config())
+}
+
+#[cfg(feature = "rcgen")]
+fn dtls12_client_with_early_server_app_data_config(
+    app_data_messages: &[&[u8]],
+    config: Arc<Config>,
+) -> (Dtls, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let client_cert = generate_self_signed_certificate().expect("gen client cert");
+    let server_cert = generate_self_signed_certificate().expect("gen server cert");
+    let mut now = Instant::now();
+
+    let mut client = Dtls::new_12(Arc::clone(&config), client_cert, now);
+    client.set_active(true);
+
+    let mut server = Dtls::new_12(config, server_cert, now);
+    server.set_active(false);
+
+    client.handle_timeout(now).expect("client timeout start");
+    client.handle_timeout(now).expect("client arm flight 1");
+    for p in collect_packets(&mut client) {
+        server.handle_packet(&p).expect("server recv ClientHello");
+    }
+
+    server.handle_timeout(now).expect("server arm flight 2");
+    for p in collect_packets(&mut server) {
+        client
+            .handle_packet(&p)
+            .expect("client recv HelloVerifyRequest");
+    }
+
+    client.handle_timeout(now).expect("client arm flight 3");
+    for p in collect_packets(&mut client) {
+        server
+            .handle_packet(&p)
+            .expect("server recv ClientHello with cookie");
+    }
+
+    server.handle_timeout(now).expect("server arm flight 4");
+    for p in collect_packets(&mut server) {
+        client.handle_packet(&p).expect("client recv server flight");
+    }
+
+    for app_data in app_data_messages {
+        server
+            .send_application_data(app_data)
+            .expect("queue server application data");
+    }
+    now += Duration::from_millis(10);
+    client.handle_timeout(now).expect("client arm flight 5");
+    let f5 = collect_packets(&mut client);
+    assert!(!f5.is_empty(), "client should emit flight 5");
+
+    for p in &f5 {
+        server.handle_packet(p).expect("server recv flight 5");
+    }
+    let server_flight = drain_outputs(&mut server).packets;
+    assert!(
+        !server_flight.is_empty(),
+        "server should emit flight 6 and queued application data"
+    );
+
+    let mut early_app_data = Vec::new();
+    let mut handshake_records = Vec::new();
+    for record in server_flight
+        .iter()
+        .flat_map(|packet| dtls12_record_chunks(packet))
+    {
+        if collect_headers(std::slice::from_ref(&record))
+            .iter()
+            .any(|h| h.ctype == 23 && h.epoch == 1)
+        {
+            early_app_data.push(record);
+        } else {
+            handshake_records.push(record);
+        }
+    }
+    assert!(
+        !early_app_data.is_empty(),
+        "server should emit encrypted app data in its final flight"
+    );
+
+    (client, early_app_data, handshake_records)
+}
+
+#[cfg(feature = "rcgen")]
+fn complete_dtls12_handshake_without_forbidden_app_data(
+    client: &mut Dtls,
+    server: &mut Dtls,
+    mut now: Instant,
+    forbidden: &[u8],
+) -> Instant {
+    let mut client_connected = false;
+    let mut server_connected = false;
+
+    for i in 0..60 {
+        client.handle_timeout(now).expect("client timeout");
+        server.handle_timeout(now).expect("server timeout");
+
+        let client_out = drain_outputs(client);
+        let server_out = drain_outputs(server);
+
+        assert!(
+            !client_out.app_data.iter().any(|data| data == forbidden),
+            "client must never emit forbidden pre-key application data"
+        );
+        assert!(
+            !server_out.app_data.iter().any(|data| data == forbidden),
+            "server must never emit forbidden pre-key application data"
+        );
+
+        client_connected |= client_out.connected;
+        server_connected |= server_out.connected;
+
+        deliver_packets(&client_out.packets, server);
+        deliver_packets(&server_out.packets, client);
+
+        if client_connected && server_connected {
+            return now;
+        }
+
+        if i % 5 == 4 {
+            now += Duration::from_secs(2);
+        } else {
+            now += Duration::from_millis(50);
+        }
+    }
+
+    panic!("DTLS 1.2 handshake did not complete within iteration limit");
 }
 
 fn dtls12_change_cipher_spec_record(seq: u64) -> Vec<u8> {
@@ -144,6 +310,487 @@ fn dtls12_prehandshake_future_epoch_records_do_not_block_client_hello() {
     assert!(
         !server_out.is_empty(),
         "server should respond after ClientHello"
+    );
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
+fn dtls12_client_duplicate_future_epoch_record_before_encryption_does_not_panic() {
+    let _ = env_logger::try_init();
+
+    let client_cert = generate_self_signed_certificate().expect("gen client cert");
+    let config = Arc::new(
+        Config::builder()
+            .max_queue_rx(1)
+            .build()
+            .expect("build config"),
+    );
+    let now = Instant::now();
+
+    let mut client = Dtls::new_12(config, client_cert, now);
+    client.set_active(true);
+    client.handle_timeout(now).expect("client timeout");
+    let first_flight = collect_packets(&mut client);
+    assert!(
+        !first_flight.is_empty(),
+        "client should emit initial ClientHello before injected future-epoch records"
+    );
+
+    let future = dtls12_future_epoch_app_data(0);
+    client
+        .handle_packet(&future)
+        .expect("pre-handshake future-epoch record should be tolerated");
+    client
+        .handle_packet(&future)
+        .expect("duplicate pre-handshake future-epoch record should be tolerated");
+
+    let outputs = collect_packets(&mut client);
+    assert!(
+        outputs.is_empty(),
+        "future-epoch records should not emit packets"
+    );
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
+fn dtls12_prekey_epoch2_future_epoch_app_data_is_never_released() {
+    let _ = env_logger::try_init();
+
+    let client_cert = generate_self_signed_certificate().expect("gen client cert");
+    let server_cert = generate_self_signed_certificate().expect("gen server cert");
+    let config = Arc::new(
+        Config::builder()
+            .max_queue_rx(1)
+            .build()
+            .expect("build config"),
+    );
+    let mut now = Instant::now();
+
+    let mut client = Dtls::new_12(Arc::clone(&config), client_cert, now);
+    client.set_active(true);
+
+    let mut server = Dtls::new_12(config, server_cert, now);
+    server.set_active(false);
+
+    let forbidden = b"unauthenticated-epoch2";
+    server
+        .handle_packet(&dtls12_app_data_record(2, 0, forbidden))
+        .expect("unsupported pre-key epoch should be tolerated and dropped");
+
+    now = complete_dtls12_handshake_without_forbidden_app_data(
+        &mut client,
+        &mut server,
+        now,
+        forbidden,
+    );
+
+    client
+        .send_application_data(b"legit-after-epoch2")
+        .expect("client send legit app data");
+    client.handle_timeout(now).expect("client timeout");
+    let client_out = drain_outputs(&mut client);
+    assert!(
+        !client_out.app_data.iter().any(|data| data == forbidden),
+        "client must not emit forbidden pre-key application data after handshake"
+    );
+    deliver_packets(&client_out.packets, &mut server);
+
+    server.handle_timeout(now).expect("server timeout");
+    let server_out = drain_outputs(&mut server);
+    assert!(
+        !server_out.app_data.iter().any(|data| data == forbidden),
+        "server must not emit forbidden pre-key application data after handshake"
+    );
+    assert!(
+        server_out
+            .app_data
+            .iter()
+            .any(|data| data.as_slice() == b"legit-after-epoch2"),
+        "legit app data should still be delivered after dropping epoch 2 poison"
+    );
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
+fn dtls12_early_future_epoch_record_is_reparsed_after_peer_keys() {
+    let _ = env_logger::try_init();
+
+    let (mut client, early_app_data, handshake_records) =
+        dtls12_client_with_early_server_app_data(b"queued-before-peer-keys");
+
+    for record in &early_app_data {
+        client
+            .handle_packet(record)
+            .expect("early future-epoch app data should stay queued");
+        client
+            .handle_packet(record)
+            .expect("duplicate early future-epoch app data should be tolerated");
+    }
+    for record in &handshake_records {
+        client
+            .handle_packet(record)
+            .expect("client should process server final-flight handshake");
+    }
+
+    let client_out = drain_outputs(&mut client);
+    assert_eq!(
+        client_out.app_data,
+        vec![b"queued-before-peer-keys".to_vec()]
+    );
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
+fn dtls12_early_future_epoch_same_sequence_poison_does_not_hide_valid_record() {
+    let _ = env_logger::try_init();
+
+    let (mut client, early_app_data, handshake_records) =
+        dtls12_client_with_early_server_app_data(b"valid-after-poison");
+    let poison = tamper_last_byte(&early_app_data[0], 0x55);
+
+    client
+        .handle_packet(&poison)
+        .expect("poison future-epoch app data should stay queued before peer keys");
+    for record in &early_app_data {
+        client
+            .handle_packet(record)
+            .expect("valid same-sequence future-epoch app data should stay queued");
+    }
+    for record in &handshake_records {
+        client
+            .handle_packet(record)
+            .expect("client should process server final-flight handshake");
+    }
+
+    let client_out = drain_outputs(&mut client);
+    assert_eq!(client_out.app_data, vec![b"valid-after-poison".to_vec()]);
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
+fn dtls12_early_future_epoch_later_poison_does_not_hide_valid_record() {
+    let _ = env_logger::try_init();
+
+    let (mut client, early_app_data, handshake_records) =
+        dtls12_client_with_early_server_app_data(b"valid-before-poison");
+    let poison = tamper_last_byte(&early_app_data[0], 0x55);
+
+    for record in &early_app_data {
+        client
+            .handle_packet(record)
+            .expect("valid future-epoch app data should stay queued");
+    }
+    client
+        .handle_packet(&poison)
+        .expect("later same-sequence poison should not evict valid candidate");
+    for record in &handshake_records {
+        client
+            .handle_packet(record)
+            .expect("client should process server final-flight handshake");
+    }
+
+    let client_out = drain_outputs(&mut client);
+    assert_eq!(client_out.app_data, vec![b"valid-before-poison".to_vec()]);
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
+fn dtls12_early_future_epoch_candidate_cap_keeps_latest_alternative() {
+    let _ = env_logger::try_init();
+
+    let (mut client, early_app_data, handshake_records) =
+        dtls12_client_with_early_server_app_data(b"valid-after-two-poisons");
+    let poison1 = tamper_last_byte(&early_app_data[0], 0x55);
+    let poison2 = tamper_last_byte(&early_app_data[0], 0xaa);
+
+    client
+        .handle_packet(&poison1)
+        .expect("first poison future-epoch app data should stay queued before peer keys");
+    client
+        .handle_packet(&poison2)
+        .expect("second poison should occupy only the bounded alternative slot");
+    for record in &early_app_data {
+        client
+            .handle_packet(record)
+            .expect("valid later same-sequence candidate should replace stale alternative");
+    }
+    for record in &handshake_records {
+        client
+            .handle_packet(record)
+            .expect("client should process server final-flight handshake");
+    }
+
+    let client_out = drain_outputs(&mut client);
+    assert_eq!(
+        client_out.app_data,
+        vec![b"valid-after-two-poisons".to_vec()]
+    );
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
+fn dtls12_early_future_epoch_candidate_cap_preserves_oldest_candidate() {
+    let _ = env_logger::try_init();
+
+    let (mut client, early_app_data, handshake_records) =
+        dtls12_client_with_early_server_app_data(b"valid-before-two-poisons");
+    let poison1 = tamper_last_byte(&early_app_data[0], 0x55);
+    let poison2 = tamper_last_byte(&early_app_data[0], 0xaa);
+
+    for record in &early_app_data {
+        client
+            .handle_packet(record)
+            .expect("valid future-epoch app data should stay queued");
+    }
+    client
+        .handle_packet(&poison1)
+        .expect("later same-sequence poison should stay bounded");
+    client
+        .handle_packet(&poison2)
+        .expect("newer same-sequence poison should replace only the alternative slot");
+    for record in &handshake_records {
+        client
+            .handle_packet(record)
+            .expect("client should process server final-flight handshake");
+    }
+
+    let client_out = drain_outputs(&mut client);
+    assert_eq!(
+        client_out.app_data,
+        vec![b"valid-before-two-poisons".to_vec()]
+    );
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
+fn dtls12_early_future_epoch_reparse_groups_multirecord_candidates_by_sequence() {
+    let _ = env_logger::try_init();
+
+    let messages: [&[u8]; 2] = [b"valid-0000", b"valid-1111"];
+    let (mut client, early_app_data, handshake_records) =
+        dtls12_client_with_early_server_app_data_config(&messages, dtls12_config());
+    assert!(
+        early_app_data.len() >= 2,
+        "test needs two encrypted app-data records"
+    );
+
+    let mut mixed = tamper_last_byte(&early_app_data[0], 0x55);
+    mixed.extend_from_slice(&early_app_data[1]);
+
+    client
+        .handle_packet(&mixed)
+        .expect("mixed future-epoch datagram should stay queued before peer keys");
+    client
+        .handle_packet(&early_app_data[0])
+        .expect("valid same-sequence candidate should stay queued after mixed datagram");
+    for record in &handshake_records {
+        client
+            .handle_packet(record)
+            .expect("client should process server final-flight handshake");
+    }
+
+    let client_out = drain_outputs(&mut client);
+    assert_eq!(
+        client_out.app_data,
+        vec![b"valid-0000".to_vec(), b"valid-1111".to_vec()]
+    );
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
+fn dtls12_early_future_epoch_full_queue_poison_then_valid_delivers_valid() {
+    let _ = env_logger::try_init();
+
+    let config = Arc::new(
+        Config::builder()
+            .max_queue_rx(1)
+            .build()
+            .expect("build config"),
+    );
+    let (mut client, early_app_data, handshake_records) =
+        dtls12_client_with_early_server_app_data_config(&[b"valid-after-full-poison"], config);
+    let poison = tamper_last_byte(&early_app_data[0], 0x55);
+
+    client
+        .handle_packet(&poison)
+        .expect("poison future-epoch app data should stay queued before peer keys");
+    for record in &early_app_data {
+        client
+            .handle_packet(record)
+            .expect("valid same-sequence future-epoch app data should merge when full");
+    }
+    for record in &handshake_records {
+        client
+            .handle_packet(record)
+            .expect("client should process server final-flight handshake");
+    }
+
+    let client_out = drain_outputs(&mut client);
+    assert_eq!(
+        client_out.app_data,
+        vec![b"valid-after-full-poison".to_vec()]
+    );
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
+fn dtls12_early_future_epoch_full_queue_finished_before_ccs_delivers_valid() {
+    let _ = env_logger::try_init();
+
+    let config = Arc::new(
+        Config::builder()
+            .max_queue_rx(1)
+            .build()
+            .expect("build config"),
+    );
+    let (mut client, early_app_data, handshake_records) =
+        dtls12_client_with_early_server_app_data_config(&[b"valid-before-finished"], config);
+
+    let early_app_data = early_app_data
+        .first()
+        .expect("server should emit early app data");
+    client
+        .handle_packet(early_app_data)
+        .expect("valid future-epoch app data should fill the receive queue");
+
+    let encrypted_finished_index = handshake_records
+        .iter()
+        .position(|record| dtls12_record_is(record, 22, 1))
+        .expect("server final flight should contain encrypted Finished");
+    let ccs_index = handshake_records
+        .iter()
+        .position(|record| dtls12_record_is(record, 20, 0))
+        .expect("server final flight should contain CCS");
+
+    client
+        .handle_packet(&handshake_records[encrypted_finished_index])
+        .expect("encrypted Finished should merge into full pre-key queue");
+    client
+        .handle_packet(&handshake_records[ccs_index])
+        .expect("CCS should merge into full pre-key queue");
+
+    for (index, record) in handshake_records.iter().enumerate() {
+        if index == encrypted_finished_index || index == ccs_index {
+            continue;
+        }
+
+        client
+            .handle_packet(record)
+            .expect("client should process remaining server final-flight records");
+    }
+
+    let client_out = drain_outputs(&mut client);
+    assert_eq!(client_out.app_data, vec![b"valid-before-finished".to_vec()]);
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
+fn dtls12_early_future_epoch_full_queue_valid_then_poison_delivers_valid() {
+    let _ = env_logger::try_init();
+
+    let config = Arc::new(
+        Config::builder()
+            .max_queue_rx(1)
+            .build()
+            .expect("build config"),
+    );
+    let (mut client, early_app_data, handshake_records) =
+        dtls12_client_with_early_server_app_data_config(&[b"valid-before-full-poison"], config);
+    let poison = tamper_last_byte(&early_app_data[0], 0x55);
+
+    for record in &early_app_data {
+        client
+            .handle_packet(record)
+            .expect("valid future-epoch app data should stay queued before peer keys");
+    }
+    client
+        .handle_packet(&poison)
+        .expect("same-sequence poison should merge without evicting valid candidate");
+    for record in &handshake_records {
+        client
+            .handle_packet(record)
+            .expect("client should process server final-flight handshake");
+    }
+
+    let client_out = drain_outputs(&mut client);
+    assert_eq!(
+        client_out.app_data,
+        vec![b"valid-before-full-poison".to_vec()]
+    );
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
+fn dtls12_early_future_epoch_full_queue_multirecord_poison_does_not_evict_valid() {
+    let _ = env_logger::try_init();
+
+    let config = Arc::new(
+        Config::builder()
+            .max_queue_rx(1)
+            .build()
+            .expect("build config"),
+    );
+    let (mut client, early_app_data, handshake_records) =
+        dtls12_client_with_early_server_app_data_config(&[b"valid-before-multipoison"], config);
+    let poison1 = tamper_last_byte(&early_app_data[0], 0x55);
+    let poison2 = tamper_last_byte(&early_app_data[0], 0xaa);
+    let mut poison_datagram = poison1;
+    poison_datagram.extend_from_slice(&poison2);
+
+    for record in &early_app_data {
+        client
+            .handle_packet(record)
+            .expect("valid future-epoch app data should stay queued before peer keys");
+    }
+    client
+        .handle_packet(&poison_datagram)
+        .expect("multi-record same-sequence poison should stay bounded");
+    for record in &handshake_records {
+        client
+            .handle_packet(record)
+            .expect("client should process server final-flight handshake");
+    }
+
+    let client_out = drain_outputs(&mut client);
+    assert_eq!(
+        client_out.app_data,
+        vec![b"valid-before-multipoison".to_vec()]
+    );
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
+fn dtls12_early_future_epoch_later_discard_does_not_hide_crypto_error() {
+    let _ = env_logger::try_init();
+
+    let (mut client, early_app_data, handshake_records) =
+        dtls12_client_with_early_server_app_data(b"unused");
+    let poison = tamper_last_byte(&early_app_data[0], 0x55);
+
+    let mut too_short = early_app_data[0][..13].to_vec();
+    too_short[11..13].copy_from_slice(&0u16.to_be_bytes());
+
+    client
+        .handle_packet(&poison)
+        .expect("poison future-epoch app data should stay queued before peer keys");
+    client.handle_packet(&too_short).expect(
+        "too-short same-sequence future-epoch app data should stay queued before peer keys",
+    );
+
+    let mut error = None;
+    for record in &handshake_records {
+        match client.handle_packet(record) {
+            Ok(()) => {}
+            Err(e) => {
+                error = Some(e);
+                break;
+            }
+        }
+    }
+
+    assert!(
+        matches!(error, Some(Error::CryptoError(_))),
+        "expected original crypto error to survive later discarded same-sequence candidate, got {error:?}"
     );
 }
 
