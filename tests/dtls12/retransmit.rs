@@ -296,6 +296,113 @@ fn dtls12_duplicate_triggers_server_resend_of_final_flight() {
 
 #[test]
 #[cfg(feature = "rcgen")]
+fn dtls12_resend_replaces_pending_handshake_flight_tail() {
+    let now0 = Instant::now();
+    let mut now = now0;
+
+    use dimpl::certificate::generate_self_signed_certificate;
+
+    let client_cert = generate_self_signed_certificate().expect("gen client cert");
+    let server_cert = generate_self_signed_certificate().expect("gen server cert");
+
+    let config_client = Arc::new(
+        Config::builder()
+            .mtu(115)
+            .build()
+            .expect("Failed to build config"),
+    );
+    let config_server = Arc::new(
+        Config::builder()
+            .mtu(115)
+            .build()
+            .expect("Failed to build config"),
+    );
+
+    let mut client = Dtls::new_12(config_client, client_cert, now);
+    client.set_active(true);
+
+    let mut server = Dtls::new_12(config_server, server_cert, now);
+    server.set_active(false);
+
+    client.handle_timeout(now).expect("client timeout start");
+    client.handle_timeout(now).expect("client arm flight 1");
+    let f1 = collect_packets(&mut client);
+    for p in f1 {
+        server.handle_packet(&p).expect("server recv f1");
+    }
+
+    server.handle_timeout(now).expect("server arm flight 2");
+    let f2 = collect_packets(&mut server);
+    for p in f2 {
+        client.handle_packet(&p).expect("client recv f2");
+    }
+
+    client.handle_timeout(now).expect("client arm flight 3");
+    let f3 = collect_packets(&mut client);
+    for p in f3 {
+        server.handle_packet(&p).expect("server recv f3");
+    }
+
+    server.handle_timeout(now).expect("server arm flight 4");
+    let first_initial = poll_one_packet(&mut server);
+    let first_initial_headers = parse_records(&first_initial);
+    assert!(
+        !first_initial_headers.is_empty(),
+        "first initial flight 4 packet should contain records"
+    );
+
+    trigger_timeout(&mut server, &mut now);
+    let pending = collect_packets(&mut server);
+    assert!(
+        !pending.is_empty(),
+        "server should emit flight 4 resend after timeout"
+    );
+    let pending_headers = collect_headers(&pending);
+    assert!(
+        pending_headers
+            .first()
+            .zip(first_initial_headers.first())
+            .is_some_and(|(resend, initial)| resend.seq > initial.seq),
+        "resend should replace pending original flight tail, got first initial \
+         {first_initial_headers:?}, pending {pending_headers:?}"
+    );
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
+fn dtls12_final_flight_resend_can_share_post_release_appdata_tail() {
+    let FinalFlightResend {
+        mut server,
+        stale_epoch0_handshake,
+        ..
+    } = prepare_server_final_flight_resend(Config::default().max_queue_rx());
+
+    let filler = vec![0x55; 50];
+    for i in 0..9 {
+        server
+            .send_application_data(&filler)
+            .unwrap_or_else(|err| panic!("queue filler app data {i}: {err:?}"));
+    }
+    server
+        .send_application_data(b"x")
+        .expect("queue final small app data");
+
+    server
+        .handle_packet(&stale_epoch0_handshake)
+        .expect("post-release duplicate should trigger final-flight resend");
+
+    let pending_headers = collect_headers(&collect_packets(&mut server));
+    assert!(
+        pending_headers
+            .iter()
+            .any(|header| header.ctype == 22 && header.epoch == 1),
+        "server should retain and resend encrypted final-flight Finished, got \
+         {pending_headers:?}"
+    );
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
 fn dtls12_late_retransmitted_ccs_does_not_pin_receive_queue() {
     //! After the handshake, a peer can still retransmit its final flight. The
     //! epoch-0 ChangeCipherSpec in that flight must be ignored; otherwise it
@@ -426,6 +533,19 @@ fn malformed_epoch0_handshake_packet(sequence_number: u64) -> Vec<u8> {
 fn append_record(mut packet: Vec<u8>, record: &[u8]) -> Vec<u8> {
     packet.extend_from_slice(record);
     packet
+}
+
+#[cfg(feature = "rcgen")]
+fn poll_one_packet(endpoint: &mut Dtls) -> Vec<u8> {
+    let mut buf = vec![0u8; 2048];
+    loop {
+        match endpoint.poll_output(&mut buf) {
+            Output::Packet(packet) => return packet.to_vec(),
+            Output::BufferTooSmall { needed } => buf.resize(needed, 0),
+            Output::Timeout(_) => panic!("expected queued packet"),
+            _ => {}
+        }
+    }
 }
 
 #[test]
