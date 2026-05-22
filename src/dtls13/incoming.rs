@@ -6,13 +6,20 @@ use std::fmt;
 
 use crate::Error;
 use crate::buffer::{Buf, TmpBuf};
-use crate::dtls13::message::{ContentType, Dtls13CipherSuite, Dtls13Record, Handshake, Sequence};
+use crate::dtls13::message::{
+    ContentType, Dtls13CipherSuite, Dtls13Record, Handshake, MessageType, Sequence,
+};
 
 /// Holds both the UDP packet and the parsed result of that packet.
 pub struct Incoming {
     // Box is here to reduce the size of the Incoming struct
     // to be passed in register instead of using memmove.
     records: Box<Records>,
+}
+
+pub(crate) struct IncomingParse {
+    pub incoming: Option<Incoming>,
+    pub deferred_tail: Option<Buf>,
 }
 
 impl Incoming {
@@ -39,23 +46,47 @@ impl Incoming {
     /// * `cs` is the negotiated cipher suite, if any.
     ///
     /// Will surface parser errors.
+    #[cfg(test)]
     pub fn parse_packet(
         packet: &[u8],
         decrypt: &mut dyn RecordHandler,
         cs: Option<Dtls13CipherSuite>,
     ) -> Result<Option<Self>, Error> {
+        Ok(Self::parse_packet_inner(packet, decrypt, cs, false)?.incoming)
+    }
+
+    pub(crate) fn parse_packet_defer_after_key_update(
+        packet: &[u8],
+        decrypt: &mut dyn RecordHandler,
+        cs: Option<Dtls13CipherSuite>,
+    ) -> Result<IncomingParse, Error> {
+        Self::parse_packet_inner(packet, decrypt, cs, true)
+    }
+
+    fn parse_packet_inner(
+        packet: &[u8],
+        decrypt: &mut dyn RecordHandler,
+        cs: Option<Dtls13CipherSuite>,
+        defer_after_key_update: bool,
+    ) -> Result<IncomingParse, Error> {
         // Parse records directly from packet, copying each record ONCE into its own buffer
-        let records = Records::parse(packet, decrypt, cs)?;
+        let parse = Records::parse_inner(packet, decrypt, cs, defer_after_key_update)?;
 
         // We need at least one Record to be valid. For replayed frames, we discard
         // the records, hence this might be None
-        if records.records.is_empty() {
-            return Ok(None);
+        if parse.records.records.is_empty() {
+            return Ok(IncomingParse {
+                incoming: None,
+                deferred_tail: parse.deferred_tail,
+            });
         }
 
-        let records = Box::new(records);
+        let records = Box::new(parse.records);
 
-        Ok(Some(Incoming { records }))
+        Ok(IncomingParse {
+            incoming: Some(Incoming { records }),
+            deferred_tail: parse.deferred_tail,
+        })
     }
 }
 
@@ -65,13 +96,20 @@ pub struct Records {
     pub records: ArrayVec<Record, 16>,
 }
 
+struct RecordsParse {
+    records: Records,
+    deferred_tail: Option<Buf>,
+}
+
 impl Records {
-    pub fn parse(
+    fn parse_inner(
         mut packet: &[u8],
         decrypt: &mut dyn RecordHandler,
         cs: Option<Dtls13CipherSuite>,
-    ) -> Result<Records, Error> {
+        defer_after_key_update: bool,
+    ) -> Result<RecordsParse, Error> {
         let mut parsed_records: ArrayVec<Record, 16> = ArrayVec::new();
+        let mut deferred_tail = None;
 
         // Find record boundaries and copy each record ONCE from the packet
         while !packet.is_empty() {
@@ -129,11 +167,23 @@ impl Records {
 
             // This is the ONLY copy: packet -> record buffer
             let record_slice = &packet[..record_end];
+            let tail = &packet[record_end..];
             match Record::parse(record_slice, decrypt, cs) {
                 Ok(record) => {
                     if let Some(record) = record {
+                        let should_defer_tail = defer_after_key_update
+                            && !tail.is_empty()
+                            && record.contains_complete_key_update();
+
                         if parsed_records.try_push(record).is_err() {
                             return Err(Error::TooManyRecords);
+                        }
+
+                        if should_defer_tail {
+                            let mut tail_buffer = Buf::new();
+                            tail_buffer.extend_from_slice(tail);
+                            deferred_tail = Some(tail_buffer);
+                            break;
                         }
                     } else {
                         trace!("Discarding replayed rec");
@@ -154,7 +204,10 @@ impl Records {
             }
         }
 
-        Ok(Records { records })
+        Ok(RecordsParse {
+            records: Records { records },
+            deferred_tail,
+        })
     }
 }
 
@@ -316,6 +369,15 @@ impl Record {
 
     pub fn first_handshake(&self) -> Option<&Handshake> {
         self.parsed.handshakes.first()
+    }
+
+    fn contains_complete_key_update(&self) -> bool {
+        self.record().content_type == ContentType::Handshake
+            && self.handshakes().iter().any(|handshake| {
+                handshake.header.msg_type == MessageType::KeyUpdate
+                    && handshake.header.fragment_offset == 0
+                    && handshake.header.fragment_length == handshake.header.length
+            })
     }
 
     pub fn is_handled(&self) -> bool {

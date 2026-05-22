@@ -197,6 +197,134 @@ fn dtls13_key_update_bidirectional_after_limit() {
     );
 }
 
+#[cfg(feature = "rcgen")]
+fn assert_key_update_and_app_data_same_datagram(
+    sender: &mut Dtls,
+    receiver: &mut Dtls,
+    now: &mut Instant,
+    priming: &'static [u8],
+    post_update: &'static [u8],
+) {
+    sender
+        .send_application_data(priming)
+        .expect("send priming app data");
+    let first_packets = collect_packets(sender);
+    assert_eq!(first_packets.len(), 1);
+
+    deliver_packets(&first_packets, receiver);
+    receiver.handle_timeout(*now).expect("receiver timeout");
+    let first_received = drain_outputs(receiver);
+    assert_eq!(first_received.app_data, vec![priming.to_vec()]);
+    deliver_packets(&first_received.packets, sender);
+
+    *now += Duration::from_millis(10);
+    sender.handle_timeout(*now).expect("sender timeout");
+    let key_update_packets = collect_packets(sender);
+    assert_eq!(key_update_packets.len(), 1);
+
+    sender
+        .send_application_data(post_update)
+        .expect("send post-key-update app data");
+    let app_packets = collect_packets(sender);
+    assert_eq!(app_packets.len(), 1);
+
+    let mut combined = key_update_packets[0].clone();
+    combined.extend_from_slice(&app_packets[0]);
+
+    receiver
+        .handle_packet(&combined)
+        .expect("receiver should accept combined datagram");
+    receiver.handle_timeout(*now).expect("receiver timeout");
+
+    let received = drain_outputs(receiver);
+    assert_eq!(
+        received.app_data,
+        vec![post_update.to_vec()],
+        "receiver should deliver new-epoch app data that follows KeyUpdate in the same datagram"
+    );
+}
+
+/// Test that application data following a KeyUpdate in the same datagram is
+/// delivered. The sender emits the KeyUpdate under the old application epoch,
+/// rotates send keys, and the datagram then carries application data under the
+/// new epoch. The receiver must process the KeyUpdate before trying to decrypt
+/// the following record.
+#[test]
+#[cfg(feature = "rcgen")]
+fn dtls13_client_key_update_and_new_epoch_app_data_in_same_datagram() {
+    use dimpl::Config;
+    use dimpl::certificate::generate_self_signed_certificate;
+
+    let _ = env_logger::try_init();
+
+    let client_cert = generate_self_signed_certificate().expect("gen client cert");
+    let server_cert = generate_self_signed_certificate().expect("gen server cert");
+
+    let config = Arc::new(
+        Config::builder()
+            .aead_encryption_limit(1)
+            .build()
+            .expect("build config"),
+    );
+
+    let mut now = Instant::now();
+
+    let mut client = Dtls::new_13(Arc::clone(&config), client_cert, now);
+    client.set_active(true);
+
+    let mut server = Dtls::new_13(config, server_cert, now);
+    server.set_active(false);
+
+    now = complete_dtls13_handshake(&mut client, &mut server, now);
+
+    assert_key_update_and_app_data_same_datagram(
+        &mut client,
+        &mut server,
+        &mut now,
+        b"client-primes-key-update",
+        b"client-same-datagram-new-epoch",
+    );
+}
+
+/// Same as the client-sender case, but with the server as the KeyUpdate sender
+/// so the client deferred-tail path is covered too.
+#[test]
+#[cfg(feature = "rcgen")]
+fn dtls13_server_key_update_and_new_epoch_app_data_in_same_datagram() {
+    use dimpl::Config;
+    use dimpl::certificate::generate_self_signed_certificate;
+
+    let _ = env_logger::try_init();
+
+    let client_cert = generate_self_signed_certificate().expect("gen client cert");
+    let server_cert = generate_self_signed_certificate().expect("gen server cert");
+
+    let config = Arc::new(
+        Config::builder()
+            .aead_encryption_limit(1)
+            .build()
+            .expect("build config"),
+    );
+
+    let mut now = Instant::now();
+
+    let mut client = Dtls::new_13(Arc::clone(&config), client_cert, now);
+    client.set_active(true);
+
+    let mut server = Dtls::new_13(config, server_cert, now);
+    server.set_active(false);
+
+    now = complete_dtls13_handshake(&mut client, &mut server, now);
+
+    assert_key_update_and_app_data_same_datagram(
+        &mut server,
+        &mut client,
+        &mut now,
+        b"server-primes-key-update",
+        b"server-same-datagram-new-epoch",
+    );
+}
+
 /// Test that a reordered packet captured before a KeyUpdate is accepted when
 /// delivered alongside other packets during the transition. The packet is from
 /// the same epoch and arrives before any new-epoch records, so the replay
