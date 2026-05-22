@@ -394,62 +394,90 @@ fn server_hello_version_inner(packet: &[u8]) -> Option<DetectedVersion> {
         return None;
     }
 
+    let message_len = ((record_body[1] as usize) << 16)
+        | ((record_body[2] as usize) << 8)
+        | (record_body[3] as usize);
+    let fragment_offset = ((record_body[6] as usize) << 16)
+        | ((record_body[7] as usize) << 8)
+        | (record_body[8] as usize);
     let fragment_len = ((record_body[9] as usize) << 16)
         | ((record_body[10] as usize) << 8)
         | (record_body[11] as usize);
+    if fragment_offset != 0 || fragment_len != message_len {
+        return None;
+    }
+
     let body = record_body.get(12..12 + fragment_len)?;
 
     // ServerHello body:
     //   server_version(2) + random(32) + session_id_len(1) + session_id + ...
-    if body.len() < 35 {
-        return Some(DetectedVersion::Dtls12);
-    }
     let mut pos = 34; // past version(2) + random(32)
 
     // session_id: 1-byte length + data
     let sid_len = *body.get(pos)? as usize;
-    pos += 1 + sid_len;
+    if sid_len > 32 {
+        return None;
+    }
+    pos = pos.checked_add(1)?.checked_add(sid_len)?;
 
-    // cipher_suite: 2 bytes
-    pos += 2;
-
-    // compression_method: 1 byte
-    pos += 1;
+    // cipher_suite(2) + compression_method(1)
+    if pos + 3 > body.len() {
+        return None;
+    }
+    pos += 3;
 
     // extensions: 2-byte total length (optional)
-    if pos + 2 > body.len() {
+    if pos == body.len() {
         // No extensions → DTLS 1.2
         return Some(DetectedVersion::Dtls12);
+    }
+    if pos + 2 > body.len() {
+        return None;
     }
     let ext_total_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
     pos += 2;
     let ext_end = pos + ext_total_len;
-    if ext_end > body.len() {
-        return Some(DetectedVersion::Dtls12);
+    if ext_end != body.len() {
+        return None;
     }
 
     // Walk extensions looking for supported_versions (0x002B)
+    let mut selected_version = None;
     while pos + 4 <= ext_end {
         let ext_type = u16::from_be_bytes([body[pos], body[pos + 1]]);
         let ext_len = u16::from_be_bytes([body[pos + 2], body[pos + 3]]) as usize;
         pos += 4;
 
+        if pos + ext_len > ext_end {
+            return None;
+        }
+
         if ext_type == 0x002B {
             // ServerHello supported_versions: just 2 bytes (selected_version)
-            if ext_len >= 2 {
-                let version = u16::from_be_bytes([body[pos], body[pos + 1]]);
-                if version == 0xFEFC {
-                    return Some(DetectedVersion::Dtls13);
-                }
+            if ext_len != 2 {
+                return None;
             }
-            return Some(DetectedVersion::Dtls12);
+
+            if selected_version
+                .replace(u16::from_be_bytes([body[pos], body[pos + 1]]))
+                .is_some()
+            {
+                return None;
+            }
         }
 
         pos += ext_len;
     }
 
-    // No supported_versions → DTLS 1.2
-    Some(DetectedVersion::Dtls12)
+    if pos != ext_end {
+        return None;
+    }
+
+    match selected_version {
+        Some(0xFEFC) => Some(DetectedVersion::Dtls13),
+        Some(_) => None,
+        None => Some(DetectedVersion::Dtls12),
+    }
 }
 
 #[cfg(test)]
@@ -483,6 +511,56 @@ mod tests {
         fn resolve(&self, _identity: &[u8]) -> Option<Vec<u8>> {
             Some(b"0123456789abcdef".to_vec())
         }
+    }
+
+    fn server_hello_packet_with_body(body: &[u8]) -> Vec<u8> {
+        let mut pkt = Vec::new();
+
+        // Record header
+        pkt.push(0x16);
+        pkt.extend_from_slice(&[0xFE, 0xFD]);
+        pkt.extend_from_slice(&[0x00, 0x00]);
+        pkt.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        let len_pos = pkt.len();
+        pkt.extend_from_slice(&[0x00, 0x00]);
+
+        // Handshake header: msg_type=2 (ServerHello)
+        pkt.push(2);
+        let hs_len_pos = pkt.len();
+        pkt.extend_from_slice(&[0x00, 0x00, 0x00]);
+        pkt.extend_from_slice(&[0x00, 0x00]);
+        pkt.extend_from_slice(&[0x00, 0x00, 0x00]);
+        let frag_len_pos = pkt.len();
+        pkt.extend_from_slice(&[0x00, 0x00, 0x00]);
+
+        pkt.extend_from_slice(body);
+
+        let body_len = body.len();
+        pkt[hs_len_pos] = 0;
+        pkt[hs_len_pos + 1] = (body_len >> 8) as u8;
+        pkt[hs_len_pos + 2] = body_len as u8;
+        pkt[frag_len_pos] = 0;
+        pkt[frag_len_pos + 1] = (body_len >> 8) as u8;
+        pkt[frag_len_pos + 2] = body_len as u8;
+
+        let record_len = (pkt.len() - 13) as u16;
+        pkt[len_pos] = (record_len >> 8) as u8;
+        pkt[len_pos + 1] = record_len as u8;
+
+        pkt
+    }
+
+    fn server_hello_packet_with_extensions(extensions: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0xFE, 0xFD]); // legacy version DTLS 1.2
+        body.extend_from_slice(&[0u8; 32]); // random
+        body.push(0x00); // session_id length = 0
+        body.extend_from_slice(&[0x13, 0x01]); // cipher_suite AES_128_GCM_SHA256
+        body.push(0x00); // compression_method = null
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(extensions);
+
+        server_hello_packet_with_body(&body)
     }
 
     #[test]
@@ -577,6 +655,227 @@ mod tests {
         pkt[len_pos + 1] = record_len as u8;
 
         assert_eq!(server_hello_version(&pkt), DetectedVersion::Dtls13);
+    }
+
+    #[test]
+    fn server_hello_rejects_truncated_supported_versions_extension() {
+        let pkt = server_hello_packet_with_extensions(&[0x00, 0x2B, 0x00, 0x02]);
+
+        assert_eq!(server_hello_version(&pkt), DetectedVersion::Unknown);
+    }
+
+    #[test]
+    fn server_hello_rejects_short_supported_versions_extension() {
+        for ext_body in [&[][..], &[0xFE][..]] {
+            let mut extensions = Vec::new();
+            extensions.extend_from_slice(&[0x00, 0x2B]);
+            extensions.extend_from_slice(&(ext_body.len() as u16).to_be_bytes());
+            extensions.extend_from_slice(ext_body);
+
+            assert_eq!(
+                server_hello_version(&server_hello_packet_with_extensions(&extensions)),
+                DetectedVersion::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn server_hello_rejects_long_supported_versions_extension() {
+        let pkt = server_hello_packet_with_extensions(&[0x00, 0x2B, 0x00, 0x03, 0xFE, 0xFC, 0x00]);
+
+        assert_eq!(server_hello_version(&pkt), DetectedVersion::Unknown);
+    }
+
+    #[test]
+    fn server_hello_rejects_unsupported_selected_versions() {
+        for selected in [[0xFE, 0xFD], [0xFE, 0xFB], [0x03, 0x04]] {
+            let pkt = server_hello_packet_with_extensions(&[
+                0x00,
+                0x2B,
+                0x00,
+                0x02,
+                selected[0],
+                selected[1],
+            ]);
+
+            assert_eq!(server_hello_version(&pkt), DetectedVersion::Unknown);
+        }
+    }
+
+    #[test]
+    fn server_hello_rejects_duplicate_supported_versions() {
+        let pkt = server_hello_packet_with_extensions(&[
+            0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC, 0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC,
+        ]);
+
+        assert_eq!(server_hello_version(&pkt), DetectedVersion::Unknown);
+    }
+
+    #[test]
+    fn server_hello_rejects_truncated_fixed_body_fields() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0xFE, 0xFD]); // legacy version DTLS 1.2
+        body.extend_from_slice(&[0u8; 32]); // random
+
+        assert_eq!(
+            server_hello_version(&server_hello_packet_with_body(&body)),
+            DetectedVersion::Unknown
+        );
+
+        body.push(0x04); // session_id length, but no session id
+        assert_eq!(
+            server_hello_version(&server_hello_packet_with_body(&body)),
+            DetectedVersion::Unknown
+        );
+
+        body[34] = 0x00; // empty session id, but no cipher suite
+        assert_eq!(
+            server_hello_version(&server_hello_packet_with_body(&body)),
+            DetectedVersion::Unknown
+        );
+
+        body.push(0x13); // partial cipher suite
+        assert_eq!(
+            server_hello_version(&server_hello_packet_with_body(&body)),
+            DetectedVersion::Unknown
+        );
+
+        body.push(0x01); // complete cipher suite, missing compression method
+        assert_eq!(
+            server_hello_version(&server_hello_packet_with_body(&body)),
+            DetectedVersion::Unknown
+        );
+    }
+
+    #[test]
+    fn server_hello_rejects_incomplete_handshake_fragments() {
+        let pkt = server_hello_packet_with_extensions(&[0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC]);
+        assert_eq!(server_hello_version(&pkt), DetectedVersion::Dtls13);
+
+        let mut nonzero_offset = pkt.clone();
+        nonzero_offset[21] = 1; // fragment_offset = 1
+        assert_eq!(
+            server_hello_version(&nonzero_offset),
+            DetectedVersion::Unknown
+        );
+
+        let mut partial_fragment = pkt;
+        partial_fragment[16] += 1; // handshake length no longer matches fragment_length
+        assert_eq!(
+            server_hello_version(&partial_fragment),
+            DetectedVersion::Unknown
+        );
+    }
+
+    #[test]
+    fn server_hello_rejects_overlong_session_id() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0xFE, 0xFD]); // legacy version DTLS 1.2
+        body.extend_from_slice(&[0u8; 32]); // random
+        body.push(33); // session_id length exceeds protocol maximum
+        body.extend_from_slice(&[0u8; 33]);
+        body.extend_from_slice(&[0x13, 0x01]); // cipher_suite AES_128_GCM_SHA256
+        body.push(0x00); // compression_method = null
+        body.extend_from_slice(&6u16.to_be_bytes());
+        body.extend_from_slice(&[0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC]);
+
+        assert_eq!(
+            server_hello_version(&server_hello_packet_with_body(&body)),
+            DetectedVersion::Unknown
+        );
+    }
+
+    #[test]
+    fn server_hello_rejects_one_byte_extensions_length() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0xFE, 0xFD]); // legacy version DTLS 1.2
+        body.extend_from_slice(&[0u8; 32]); // random
+        body.push(0x00); // session_id length = 0
+        body.extend_from_slice(&[0x13, 0x01]); // cipher_suite AES_128_GCM_SHA256
+        body.push(0x00); // compression_method = null
+        body.push(0x00); // truncated extensions length
+
+        assert_eq!(
+            server_hello_version(&server_hello_packet_with_body(&body)),
+            DetectedVersion::Unknown
+        );
+    }
+
+    #[test]
+    fn server_hello_rejects_trailing_bytes_after_extensions_vector() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0xFE, 0xFD]); // legacy version DTLS 1.2
+        body.extend_from_slice(&[0u8; 32]); // random
+        body.push(0x00); // session_id length = 0
+        body.extend_from_slice(&[0x13, 0x01]); // cipher_suite AES_128_GCM_SHA256
+        body.push(0x00); // compression_method = null
+        body.extend_from_slice(&0u16.to_be_bytes()); // extensions length = 0
+        body.extend_from_slice(&[0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC]); // trailing bytes
+
+        assert_eq!(
+            server_hello_version(&server_hello_packet_with_body(&body)),
+            DetectedVersion::Unknown
+        );
+    }
+
+    #[test]
+    fn server_hello_rejects_trailing_bytes_after_valid_supported_versions_vector() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0xFE, 0xFD]); // legacy version DTLS 1.2
+        body.extend_from_slice(&[0u8; 32]); // random
+        body.push(0x00); // session_id length = 0
+        body.extend_from_slice(&[0x13, 0x01]); // cipher_suite AES_128_GCM_SHA256
+        body.push(0x00); // compression_method = null
+        body.extend_from_slice(&6u16.to_be_bytes()); // declared extensions length
+        body.extend_from_slice(&[0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC]); // supported_versions
+        body.push(0x00); // trailing byte outside declared vector
+
+        assert_eq!(
+            server_hello_version(&server_hello_packet_with_body(&body)),
+            DetectedVersion::Unknown
+        );
+    }
+
+    #[test]
+    fn server_hello_rejects_oversized_extensions_vector() {
+        let mut pkt = server_hello_packet_with_extensions(&[]);
+        let ext_len_pos = pkt.len() - 2;
+
+        pkt[ext_len_pos..].copy_from_slice(&4u16.to_be_bytes());
+
+        assert_eq!(server_hello_version(&pkt), DetectedVersion::Unknown);
+    }
+
+    #[test]
+    fn server_hello_rejects_trailing_partial_extension_header() {
+        for trailing in [&[0x00][..], &[0x00, 0x2B][..], &[0x00, 0x2B, 0x00][..]] {
+            assert_eq!(
+                server_hello_version(&server_hello_packet_with_extensions(trailing)),
+                DetectedVersion::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn server_hello_rejects_malformed_tail_after_supported_versions() {
+        for trailing in [&[0x00][..], &[0x00, 0x2B][..], &[0x00, 0x2B, 0x00][..]] {
+            let mut extensions = vec![0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC];
+            extensions.extend_from_slice(trailing);
+
+            assert_eq!(
+                server_hello_version(&server_hello_packet_with_extensions(&extensions)),
+                DetectedVersion::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn server_hello_rejects_oversized_extension_after_supported_versions() {
+        let pkt = server_hello_packet_with_extensions(&[
+            0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC, 0x00, 0x0A, 0x00, 0x04, 0x01, 0x02,
+        ]);
+
+        assert_eq!(server_hello_version(&pkt), DetectedVersion::Unknown);
     }
 
     #[test]
