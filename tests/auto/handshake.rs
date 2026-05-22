@@ -522,6 +522,103 @@ fn auto_client_to_dtls13_server_no_cookie() {
     );
 }
 
+#[test]
+#[cfg(feature = "rcgen")]
+fn auto_client_to_dtls13_server_no_cookie_coalesced_server_flight_progresses_without_retransmit() {
+    //! The auto client must process a no-cookie DTLS 1.3 server flight where
+    //! plaintext ServerHello is followed by short-header encrypted records in
+    //! the same UDP datagram. Progress must not depend on a later server
+    //! retransmission.
+    use dimpl::certificate::generate_self_signed_certificate;
+
+    let _ = env_logger::try_init();
+
+    let client_cert = generate_self_signed_certificate().expect("gen client cert");
+    let server_cert = generate_self_signed_certificate().expect("gen server cert");
+
+    let client_config = default_config();
+    let server_config = no_cookie_config();
+
+    let now = Instant::now();
+
+    let mut client = Dtls::new_auto(client_config, client_cert, now);
+    client.set_active(true);
+
+    let mut server = Dtls::new_13(server_config, server_cert, now);
+    server.set_active(false);
+
+    client.handle_timeout(now).expect("client timeout");
+    server.handle_timeout(now).expect("server timeout");
+    let client_out = drain_outputs(&mut client);
+    assert!(
+        !client_out.packets.is_empty(),
+        "client should emit initial ClientHello"
+    );
+    deliver_packets(&client_out.packets, &mut server);
+
+    let server_out = drain_outputs(&mut server);
+    let server_flight = coalesced_server_flight(&server_out.packets);
+    assert!(
+        packet_has_plaintext_server_hello_then_ciphertext_tail(&server_flight),
+        "test must deliver a coalesced ServerHello + encrypted tail flight"
+    );
+
+    client
+        .handle_packet(&server_flight)
+        .expect("client should accept coalesced server flight");
+    let client_out = drain_outputs(&mut client);
+
+    assert!(
+        !client_out.packets.is_empty(),
+        "client should answer the first coalesced server flight without waiting for retransmit"
+    );
+}
+
+fn coalesced_server_flight(packets: &[Vec<u8>]) -> Vec<u8> {
+    if let Some(packet) = packets
+        .iter()
+        .find(|packet| packet_has_plaintext_server_hello_then_ciphertext_tail(packet))
+    {
+        return packet.clone();
+    }
+
+    let mut combined = Vec::new();
+    for packet in packets {
+        combined.extend_from_slice(packet);
+    }
+    combined
+}
+
+fn packet_has_plaintext_server_hello_then_ciphertext_tail(mut packet: &[u8]) -> bool {
+    let mut saw_server_hello = false;
+
+    while !packet.is_empty() {
+        if packet[0] & 0b1110_0000 == 0b0010_0000 {
+            return saw_server_hello;
+        }
+
+        if packet.len() < 13 {
+            return false;
+        }
+
+        let record_len = u16::from_be_bytes([packet[11], packet[12]]) as usize;
+        let Some(record_end) = 13usize.checked_add(record_len) else {
+            return false;
+        };
+        let Some(record_body) = packet.get(13..record_end) else {
+            return false;
+        };
+
+        if packet[0] == 0x16 && record_body.first() == Some(&2) {
+            saw_server_hello = true;
+        }
+
+        packet = &packet[record_end..];
+    }
+
+    false
+}
+
 /// Auto-sense client defers the hybrid ClientHello when the poll buffer
 /// is too small, and emits it on the next poll with a large enough buffer.
 #[test]

@@ -1,7 +1,7 @@
 /// Version detection and hybrid ClientHello for auto-sensing DTLS endpoints.
 ///
-/// `server_hello_version` does lightweight parsing of the first record in a
-/// datagram. It looks for a `HelloVerifyRequest` or a `ServerHello` with the
+/// `server_hello_version` does lightweight parsing of records in a datagram.
+/// It looks for a `HelloVerifyRequest` or a `ServerHello` with the
 /// `supported_versions` extension to decide between DTLS 1.2 and 1.3 for the
 /// client auto-sense path.
 ///
@@ -40,6 +40,13 @@ const EXT_EXTENDED_MASTER_SECRET: u16 = 0x0017;
 const EXT_SUPPORTED_VERSIONS: u16 = 0x002B;
 const EXT_KEY_SHARE: u16 = 0x0033;
 const EXT_RENEGOTIATION_INFO: u16 = 0xFF01;
+
+const MAX_PENDING_SERVER_RESPONSE_PACKETS: usize = 8;
+const MAX_PENDING_SERVER_RESPONSE_BYTES: usize =
+    MAX_PENDING_SERVER_RESPONSE_PACKETS * (MAX_SERVER_HELLO_REASSEMBLY + 64);
+const MAX_SERVER_HELLO_RECORDS_PER_PACKET: usize = 8;
+const MAX_SERVER_HELLO_FRAGMENTS: usize = 64;
+const MAX_SERVER_HELLO_REASSEMBLY: usize = 4096;
 
 /// A self-contained hybrid ClientHello compatible with both DTLS 1.2 and 1.3.
 ///
@@ -272,6 +279,8 @@ pub(crate) struct ClientPending {
     retransmit_at: Option<Instant>,
     /// How many retransmits have occurred.
     retransmit_count: usize,
+    /// ServerHello fragments that were not sufficient to resolve auto mode yet.
+    server_response_fragments: ArrayVec<Buf, MAX_PENDING_SERVER_RESPONSE_PACKETS>,
 }
 
 impl ClientPending {
@@ -291,6 +300,7 @@ impl ClientPending {
             last_now: now,
             retransmit_at: None,
             retransmit_count: 0,
+            server_response_fragments: ArrayVec::new(),
         })
     }
 
@@ -335,8 +345,55 @@ impl ClientPending {
         Output::Timeout(next)
     }
 
-    pub fn into_parts(self) -> (HybridClientHello, Arc<Config>, DtlsCertificate, Instant) {
-        (self.hybrid, self.config, self.certificate, self.last_now)
+    pub fn push_server_response_fragment(
+        &mut self,
+        packet: &[u8],
+    ) -> Result<DetectedVersion, Error> {
+        if packet_has_new_server_hello_fragment(&self.server_response_fragments, packet) {
+            if self.server_response_fragments.is_full() {
+                return Err(Error::TooManyServerHelloFragments);
+            }
+            let queued_bytes: usize = self
+                .server_response_fragments
+                .iter()
+                .map(|queued| queued.len())
+                .sum();
+            if queued_bytes.saturating_add(packet.len()) > MAX_PENDING_SERVER_RESPONSE_BYTES {
+                return Err(Error::TooManyServerHelloFragments);
+            }
+
+            let mut queued = Buf::new();
+            queued.extend_from_slice(packet);
+            self.server_response_fragments.push(queued);
+        }
+
+        Ok(server_hello_version_from_fragments(
+            self.server_response_fragments
+                .iter()
+                .map(|queued| queued.as_ref()),
+        ))
+    }
+
+    pub fn has_server_response_fragments(&self) -> bool {
+        !self.server_response_fragments.is_empty()
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        HybridClientHello,
+        Arc<Config>,
+        DtlsCertificate,
+        Instant,
+        ArrayVec<Buf, MAX_PENDING_SERVER_RESPONSE_PACKETS>,
+    ) {
+        (
+            self.hybrid,
+            self.config,
+            self.certificate,
+            self.last_now,
+            self.server_response_fragments,
+        )
     }
 }
 
@@ -349,6 +406,7 @@ impl ClientPending {
 pub(crate) enum DetectedVersion {
     Dtls12,
     Dtls13,
+    Incomplete,
     Unknown,
 }
 
@@ -357,99 +415,572 @@ pub(crate) enum DetectedVersion {
 /// - HelloVerifyRequest (msg_type 3) → `Dtls12`
 /// - ServerHello with `supported_versions` containing DTLS 1.3 → `Dtls13`
 /// - ServerHello without `supported_versions` → `Dtls12`
+/// - Incomplete initial ServerHello fragment without enough evidence → `Incomplete`
 /// - Anything else → `Unknown`
 pub(crate) fn server_hello_version(packet: &[u8]) -> DetectedVersion {
-    server_hello_version_inner(packet).unwrap_or(DetectedVersion::Unknown)
+    server_hello_version_inner(packet)
 }
 
-fn server_hello_version_inner(packet: &[u8]) -> Option<DetectedVersion> {
+pub(crate) fn server_hello_version_from_fragments<'a>(
+    packets: impl IntoIterator<Item = &'a [u8]>,
+) -> DetectedVersion {
+    let mut fragments = Vec::new();
+    let mut saw_hello_verify_request = false;
+    let mut saw_opaque_tail = false;
+
+    for packet in packets {
+        match collect_server_hello_fragments(packet, &mut fragments) {
+            PacketServerHelloFragments::Parsed(flags) => {
+                saw_hello_verify_request |= flags.saw_hello_verify_request;
+                saw_opaque_tail |= flags.saw_opaque_tail;
+            }
+            PacketServerHelloFragments::Unknown => return DetectedVersion::Unknown,
+        }
+    }
+
+    if saw_hello_verify_request {
+        return if fragments.is_empty() {
+            DetectedVersion::Dtls12
+        } else {
+            DetectedVersion::Unknown
+        };
+    }
+
+    reject_dtls12_after_opaque_tail(
+        server_hello_version_from_collected_fragments(&fragments),
+        saw_opaque_tail,
+    )
+}
+
+fn server_hello_version_inner(packet: &[u8]) -> DetectedVersion {
+    let mut fragments = Vec::new();
+    match collect_server_hello_fragments(packet, &mut fragments) {
+        PacketServerHelloFragments::Parsed(flags)
+            if flags.saw_hello_verify_request && fragments.is_empty() =>
+        {
+            DetectedVersion::Dtls12
+        }
+        PacketServerHelloFragments::Parsed(flags)
+            if flags.saw_hello_verify_request && !fragments.is_empty() =>
+        {
+            DetectedVersion::Unknown
+        }
+        PacketServerHelloFragments::Unknown => DetectedVersion::Unknown,
+        PacketServerHelloFragments::Parsed(flags) => reject_dtls12_after_opaque_tail(
+            server_hello_version_from_collected_fragments(&fragments),
+            flags.saw_opaque_tail,
+        ),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ServerHelloFragmentRef<'a> {
+    message_len: usize,
+    message_seq: u16,
+    fragment_offset: usize,
+    fragment_len: usize,
+    body: &'a [u8],
+}
+
+#[derive(Clone, Copy, Default)]
+struct PacketServerHelloFlags {
+    saw_hello_verify_request: bool,
+    saw_opaque_tail: bool,
+}
+
+enum PacketServerHelloFragments {
+    Parsed(PacketServerHelloFlags),
+    Unknown,
+}
+
+fn collect_server_hello_fragments<'a>(
+    mut packet: &'a [u8],
+    fragments: &mut Vec<ServerHelloFragmentRef<'a>>,
+) -> PacketServerHelloFragments {
+    let initial_len = fragments.len();
+    let mut records = 0usize;
+    let mut flags = PacketServerHelloFlags::default();
+    while !packet.is_empty() {
+        if packet[0] != 0x16 {
+            if fragments.len() != initial_len
+                && is_dtls13_ciphertext_header(packet[0])
+                && ciphertext_tail_boundaries_are_valid(packet, records)
+            {
+                flags.saw_opaque_tail = true;
+                break;
+            }
+            return PacketServerHelloFragments::Unknown;
+        }
+
+        let Some((record_body, record_end)) = next_record_body(packet) else {
+            return PacketServerHelloFragments::Unknown;
+        };
+
+        records += 1;
+        if records > MAX_SERVER_HELLO_RECORDS_PER_PACKET {
+            return PacketServerHelloFragments::Unknown;
+        }
+
+        match collect_record_server_hello_fragments(record_body, fragments) {
+            PacketServerHelloFragments::Parsed(record_flags) => {
+                flags.saw_hello_verify_request |= record_flags.saw_hello_verify_request;
+                flags.saw_opaque_tail |= record_flags.saw_opaque_tail;
+            }
+            PacketServerHelloFragments::Unknown => return PacketServerHelloFragments::Unknown,
+        }
+
+        packet = &packet[record_end..];
+    }
+
+    if fragments.len() == initial_len && !flags.saw_hello_verify_request {
+        PacketServerHelloFragments::Unknown
+    } else {
+        PacketServerHelloFragments::Parsed(flags)
+    }
+}
+
+fn next_record_body(packet: &[u8]) -> Option<(&[u8], usize)> {
     // Record header: content_type(1) + version(2) + epoch(2) + seq(6) + length(2) = 13
     if packet.len() < 13 {
         return None;
     }
-
-    // content_type must be 0x16 (Handshake)
-    if packet[0] != 0x16 {
+    let version = [packet[1], packet[2]];
+    if !matches!(version, [0xFE, 0xFF] | [0xFE, 0xFD]) {
+        return None;
+    }
+    if packet[3] != 0 || packet[4] != 0 {
         return None;
     }
 
     let record_len = u16::from_be_bytes([packet[11], packet[12]]) as usize;
-    let record_body = packet.get(13..13 + record_len)?;
+    let record_end = 13usize.checked_add(record_len)?;
+    let record_body = packet.get(13..record_end)?;
 
-    // Handshake header: msg_type(1) + length(3) + message_seq(2) +
-    //   fragment_offset(3) + fragment_length(3) = 12
-    if record_body.len() < 12 {
-        return None;
+    Some((record_body, record_end))
+}
+
+fn collect_record_server_hello_fragments<'a>(
+    mut record_body: &'a [u8],
+    fragments: &mut Vec<ServerHelloFragmentRef<'a>>,
+) -> PacketServerHelloFragments {
+    let mut flags = PacketServerHelloFlags::default();
+    while !record_body.is_empty() {
+        // Handshake header: msg_type(1) + length(3) + message_seq(2) +
+        //   fragment_offset(3) + fragment_length(3) = 12
+        if record_body.len() < 12 {
+            return PacketServerHelloFragments::Unknown;
+        }
+
+        let msg_type = record_body[0];
+        let message_len = ((record_body[1] as usize) << 16)
+            | ((record_body[2] as usize) << 8)
+            | (record_body[3] as usize);
+        let message_seq = u16::from_be_bytes([record_body[4], record_body[5]]);
+        let fragment_offset = ((record_body[6] as usize) << 16)
+            | ((record_body[7] as usize) << 8)
+            | (record_body[8] as usize);
+        let fragment_len = ((record_body[9] as usize) << 16)
+            | ((record_body[10] as usize) << 8)
+            | (record_body[11] as usize);
+        if fragment_offset > message_len || fragment_len > message_len - fragment_offset {
+            return PacketServerHelloFragments::Unknown;
+        }
+
+        let Some(body_end) = 12usize.checked_add(fragment_len) else {
+            return PacketServerHelloFragments::Unknown;
+        };
+        let Some(body) = record_body.get(12..body_end) else {
+            return PacketServerHelloFragments::Unknown;
+        };
+
+        // HelloVerifyRequest → DTLS 1.2, but only when it is structurally
+        // valid and not mixed with ServerHello evidence in the same response.
+        if msg_type == 3 {
+            if !hello_verify_request_body_is_valid(
+                body,
+                message_len,
+                message_seq,
+                fragment_offset,
+                fragment_len,
+            ) {
+                return PacketServerHelloFragments::Unknown;
+            }
+            flags.saw_hello_verify_request = true;
+            record_body = &record_body[body_end..];
+            continue;
+        }
+
+        // ServerHello → inspect supported_versions.
+        if msg_type == 2 {
+            if message_len > MAX_SERVER_HELLO_REASSEMBLY
+                || fragments.len() >= MAX_SERVER_HELLO_FRAGMENTS
+            {
+                return PacketServerHelloFragments::Unknown;
+            }
+            fragments.push(ServerHelloFragmentRef {
+                message_len,
+                message_seq,
+                fragment_offset,
+                fragment_len,
+                body,
+            });
+        }
+
+        record_body = &record_body[body_end..];
     }
 
-    let msg_type = record_body[0];
+    PacketServerHelloFragments::Parsed(flags)
+}
 
-    // HelloVerifyRequest → DTLS 1.2
-    if msg_type == 3 {
-        return Some(DetectedVersion::Dtls12);
+fn hello_verify_request_body_is_valid(
+    body: &[u8],
+    message_len: usize,
+    message_seq: u16,
+    fragment_offset: usize,
+    fragment_len: usize,
+) -> bool {
+    if message_seq != 0
+        || fragment_offset != 0
+        || fragment_len != message_len
+        || body.len() != message_len
+    {
+        return false;
     }
 
-    // ServerHello → inspect supported_versions
-    if msg_type != 2 {
-        return None;
+    let Some((&cookie_len, cookie)) = body.get(2).zip(body.get(3..)) else {
+        return false;
+    };
+
+    let version = u16::from_be_bytes([body[0], body[1]]);
+    matches!(version, 0xFEFF | 0xFEFD) && cookie_len > 0 && cookie.len() == cookie_len as usize
+}
+
+fn is_dtls13_ciphertext_header(byte: u8) -> bool {
+    byte & 0b1110_0000 == 0b0010_0000
+}
+
+fn ciphertext_tail_boundaries_are_valid(mut packet: &[u8], mut records: usize) -> bool {
+    while !packet.is_empty() {
+        if !is_dtls13_ciphertext_header(packet[0]) || packet[0] & 0b0001_0000 != 0 {
+            return false;
+        }
+
+        let flags = packet[0];
+        let seq_len = if flags & 0b0000_1000 != 0 { 2 } else { 1 };
+        let len_len = if flags & 0b0000_0100 != 0 { 2 } else { 0 };
+        let header_len = 1 + seq_len + len_len;
+        if packet.len() < header_len {
+            return false;
+        }
+
+        records += 1;
+        if records > MAX_SERVER_HELLO_RECORDS_PER_PACKET {
+            return false;
+        }
+
+        let record_end = if len_len == 2 {
+            let len_offset = 1 + seq_len;
+            let length = u16::from_be_bytes([packet[len_offset], packet[len_offset + 1]]) as usize;
+            let Some(record_end) = header_len.checked_add(length) else {
+                return false;
+            };
+            if record_end > packet.len() {
+                return false;
+            }
+            record_end
+        } else {
+            packet.len()
+        };
+
+        packet = &packet[record_end..];
     }
 
-    let fragment_len = ((record_body[9] as usize) << 16)
-        | ((record_body[10] as usize) << 8)
-        | (record_body[11] as usize);
-    let body = record_body.get(12..12 + fragment_len)?;
+    true
+}
 
+fn packet_has_new_server_hello_fragment(
+    queued_packets: &ArrayVec<Buf, MAX_PENDING_SERVER_RESPONSE_PACKETS>,
+    packet: &[u8],
+) -> bool {
+    let mut incoming = Vec::new();
+    let incoming_flags = match collect_server_hello_fragments(packet, &mut incoming) {
+        PacketServerHelloFragments::Parsed(flags) => flags,
+        PacketServerHelloFragments::Unknown => {
+            return !queued_packets
+                .iter()
+                .any(|queued| queued.as_ref() == packet);
+        }
+    };
+
+    if incoming_flags.saw_hello_verify_request {
+        return !queued_packets
+            .iter()
+            .any(|queued| queued.as_ref() == packet);
+    }
+
+    let mut queued_fragments = Vec::new();
+    for queued in queued_packets {
+        if matches!(
+            collect_server_hello_fragments(queued.as_ref(), &mut queued_fragments),
+            PacketServerHelloFragments::Parsed(PacketServerHelloFlags {
+                saw_hello_verify_request: true,
+                ..
+            })
+        ) {
+            return true;
+        }
+    }
+
+    incoming.iter().any(|fragment| {
+        !queued_fragments
+            .iter()
+            .any(|queued| server_hello_fragment_eq(fragment, queued))
+    })
+}
+
+fn server_hello_fragment_eq(
+    left: &ServerHelloFragmentRef<'_>,
+    right: &ServerHelloFragmentRef<'_>,
+) -> bool {
+    left.message_len == right.message_len
+        && left.message_seq == right.message_seq
+        && left.fragment_offset == right.fragment_offset
+        && left.fragment_len == right.fragment_len
+        && left.body == right.body
+}
+
+fn reassembled_server_hello_version(fragments: &[ServerHelloFragmentRef<'_>]) -> DetectedVersion {
+    let Some(first) = fragments.first().copied() else {
+        return DetectedVersion::Incomplete;
+    };
+
+    if fragments.iter().any(|fragment| {
+        fragment.message_len != first.message_len || fragment.message_seq != first.message_seq
+    }) {
+        return DetectedVersion::Unknown;
+    }
+
+    let mut body = vec![None; first.message_len];
+    let mut filled = 0usize;
+    for fragment in fragments {
+        for (index, byte) in fragment.body.iter().copied().enumerate() {
+            let pos = fragment.fragment_offset + index;
+            match body[pos] {
+                Some(existing) if existing != byte => return DetectedVersion::Unknown,
+                Some(_) => {}
+                None => {
+                    body[pos] = Some(byte);
+                    filled += 1;
+                }
+            }
+        }
+    }
+
+    if filled != first.message_len {
+        return DetectedVersion::Incomplete;
+    }
+
+    let mut reassembled = Vec::with_capacity(first.message_len);
+    for byte in body {
+        let Some(byte) = byte else {
+            return DetectedVersion::Incomplete;
+        };
+        reassembled.push(byte);
+    }
+
+    server_hello_body_version(&reassembled, first.message_len, true)
+}
+
+fn server_hello_version_from_collected_fragments(
+    fragments: &[ServerHelloFragmentRef<'_>],
+) -> DetectedVersion {
+    if !server_hello_fragments_are_consistent(fragments) {
+        return DetectedVersion::Unknown;
+    }
+
+    reassembled_server_hello_version(fragments)
+}
+
+fn server_hello_fragments_are_consistent(fragments: &[ServerHelloFragmentRef<'_>]) -> bool {
+    let Some(first) = fragments.first().copied() else {
+        return true;
+    };
+
+    let mut body = vec![None; first.message_len];
+    for fragment in fragments {
+        if fragment.message_len != first.message_len || fragment.message_seq != first.message_seq {
+            return false;
+        }
+
+        for (index, byte) in fragment.body.iter().copied().enumerate() {
+            let pos = fragment.fragment_offset + index;
+            match body[pos] {
+                Some(existing) if existing != byte => return false,
+                Some(_) => {}
+                None => body[pos] = Some(byte),
+            }
+        }
+    }
+
+    true
+}
+
+fn reject_dtls12_after_opaque_tail(
+    version: DetectedVersion,
+    saw_opaque_tail: bool,
+) -> DetectedVersion {
+    if saw_opaque_tail && version == DetectedVersion::Dtls12 {
+        DetectedVersion::Unknown
+    } else {
+        version
+    }
+}
+
+fn server_hello_body_version(
+    body: &[u8],
+    message_len: usize,
+    is_complete: bool,
+) -> DetectedVersion {
     // ServerHello body:
     //   server_version(2) + random(32) + session_id_len(1) + session_id + ...
-    if body.len() < 35 {
-        return Some(DetectedVersion::Dtls12);
+    let Some(version) = body.get(0..2) else {
+        return incomplete_or_unknown(is_complete);
+    };
+    if version != [0xFE, 0xFD] {
+        return DetectedVersion::Unknown;
+    }
+    if body.len() < 34 {
+        return incomplete_or_unknown(is_complete);
     }
     let mut pos = 34; // past version(2) + random(32)
 
     // session_id: 1-byte length + data
-    let sid_len = *body.get(pos)? as usize;
-    pos += 1 + sid_len;
+    let Some(sid_len) = body.get(pos).copied() else {
+        return incomplete_or_unknown(is_complete);
+    };
+    let sid_len = sid_len as usize;
+    if sid_len > 32 {
+        return DetectedVersion::Unknown;
+    }
+    let Some(next_pos) = pos.checked_add(1).and_then(|pos| pos.checked_add(sid_len)) else {
+        return DetectedVersion::Unknown;
+    };
+    pos = next_pos;
+    if pos > body.len() {
+        return incomplete_or_unknown(is_complete);
+    }
 
-    // cipher_suite: 2 bytes
-    pos += 2;
-
-    // compression_method: 1 byte
-    pos += 1;
+    // cipher_suite(2) + compression_method(1)
+    if pos + 3 > body.len() {
+        return incomplete_or_unknown(is_complete);
+    }
+    let compression_method = body[pos + 2];
+    if compression_method != 0 {
+        return DetectedVersion::Unknown;
+    }
+    pos += 3;
 
     // extensions: 2-byte total length (optional)
+    if pos == body.len() {
+        return if is_complete {
+            // No extensions → DTLS 1.2
+            DetectedVersion::Dtls12
+        } else {
+            DetectedVersion::Incomplete
+        };
+    }
     if pos + 2 > body.len() {
-        // No extensions → DTLS 1.2
-        return Some(DetectedVersion::Dtls12);
+        return incomplete_or_unknown(is_complete);
     }
     let ext_total_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
     pos += 2;
-    let ext_end = pos + ext_total_len;
-    if ext_end > body.len() {
-        return Some(DetectedVersion::Dtls12);
+    let Some(ext_end) = pos.checked_add(ext_total_len) else {
+        return DetectedVersion::Unknown;
+    };
+    if ext_end > message_len {
+        return DetectedVersion::Unknown;
+    }
+    if is_complete {
+        if ext_end != body.len() {
+            return DetectedVersion::Unknown;
+        }
+    } else if ext_end <= body.len() {
+        // The extensions vector is the last ServerHello field. If a partial
+        // fragment already contains the complete vector, the full body cannot
+        // legally have more bytes after it.
+        return DetectedVersion::Unknown;
     }
 
     // Walk extensions looking for supported_versions (0x002B)
-    while pos + 4 <= ext_end {
+    let mut selected_version = None;
+    let visible_end = body.len().min(ext_end);
+    while pos < visible_end {
+        if pos + 4 > visible_end {
+            if is_complete {
+                return DetectedVersion::Unknown;
+            }
+            return detected_or_incomplete(selected_version);
+        }
+
         let ext_type = u16::from_be_bytes([body[pos], body[pos + 1]]);
         let ext_len = u16::from_be_bytes([body[pos + 2], body[pos + 3]]) as usize;
         pos += 4;
 
+        if pos + ext_len > visible_end {
+            if is_complete {
+                return DetectedVersion::Unknown;
+            }
+            if ext_type == 0x002B && ext_len != 2 {
+                return DetectedVersion::Unknown;
+            }
+            return detected_or_incomplete(selected_version);
+        }
+
         if ext_type == 0x002B {
             // ServerHello supported_versions: just 2 bytes (selected_version)
-            if ext_len >= 2 {
-                let version = u16::from_be_bytes([body[pos], body[pos + 1]]);
-                if version == 0xFEFC {
-                    return Some(DetectedVersion::Dtls13);
-                }
+            if ext_len != 2 {
+                return DetectedVersion::Unknown;
             }
-            return Some(DetectedVersion::Dtls12);
+
+            if selected_version
+                .replace(u16::from_be_bytes([body[pos], body[pos + 1]]))
+                .is_some()
+            {
+                return DetectedVersion::Unknown;
+            }
         }
 
         pos += ext_len;
     }
 
-    // No supported_versions → DTLS 1.2
-    Some(DetectedVersion::Dtls12)
+    if pos != ext_end {
+        if is_complete {
+            return DetectedVersion::Unknown;
+        }
+        return detected_or_incomplete(selected_version);
+    }
+
+    match selected_version {
+        Some(0xFEFC) => DetectedVersion::Dtls13,
+        Some(_) => DetectedVersion::Unknown,
+        None => DetectedVersion::Dtls12,
+    }
+}
+
+fn incomplete_or_unknown(is_complete: bool) -> DetectedVersion {
+    if is_complete {
+        DetectedVersion::Unknown
+    } else {
+        DetectedVersion::Incomplete
+    }
+}
+
+fn detected_or_incomplete(selected_version: Option<u16>) -> DetectedVersion {
+    match selected_version {
+        Some(0xFEFC) => DetectedVersion::Dtls13,
+        Some(_) => DetectedVersion::Unknown,
+        None => DetectedVersion::Incomplete,
+    }
 }
 
 #[cfg(test)]
@@ -485,6 +1016,139 @@ mod tests {
         }
     }
 
+    fn server_hello_packet_with_body(body: &[u8]) -> Vec<u8> {
+        let mut pkt = Vec::new();
+
+        // Record header
+        pkt.push(0x16);
+        pkt.extend_from_slice(&[0xFE, 0xFD]);
+        pkt.extend_from_slice(&[0x00, 0x00]);
+        pkt.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        let len_pos = pkt.len();
+        pkt.extend_from_slice(&[0x00, 0x00]);
+
+        // Handshake header: msg_type=2 (ServerHello)
+        pkt.push(2);
+        let hs_len_pos = pkt.len();
+        pkt.extend_from_slice(&[0x00, 0x00, 0x00]);
+        pkt.extend_from_slice(&[0x00, 0x00]);
+        pkt.extend_from_slice(&[0x00, 0x00, 0x00]);
+        let frag_len_pos = pkt.len();
+        pkt.extend_from_slice(&[0x00, 0x00, 0x00]);
+
+        pkt.extend_from_slice(body);
+
+        let body_len = body.len();
+        pkt[hs_len_pos] = 0;
+        pkt[hs_len_pos + 1] = (body_len >> 8) as u8;
+        pkt[hs_len_pos + 2] = body_len as u8;
+        pkt[frag_len_pos] = 0;
+        pkt[frag_len_pos + 1] = (body_len >> 8) as u8;
+        pkt[frag_len_pos + 2] = body_len as u8;
+
+        let record_len = (pkt.len() - 13) as u16;
+        pkt[len_pos] = (record_len >> 8) as u8;
+        pkt[len_pos + 1] = record_len as u8;
+
+        pkt
+    }
+
+    fn server_hello_body_with_extensions(extensions: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0xFE, 0xFD]); // legacy version DTLS 1.2
+        body.extend_from_slice(&[0u8; 32]); // random
+        body.push(0x00); // session_id length = 0
+        body.extend_from_slice(&[0x13, 0x01]); // cipher_suite AES_128_GCM_SHA256
+        body.push(0x00); // compression_method = null
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(extensions);
+        body
+    }
+
+    fn server_hello_packet_with_extensions(extensions: &[u8]) -> Vec<u8> {
+        server_hello_packet_with_body(&server_hello_body_with_extensions(extensions))
+    }
+
+    fn fragmented_server_hello_packet(full_body: &[u8], offset: usize, len: usize) -> Vec<u8> {
+        let fragment = &full_body[offset..offset + len];
+        let mut pkt = Vec::new();
+
+        pkt.push(0x16);
+        pkt.extend_from_slice(&[0xFE, 0xFD]);
+        pkt.extend_from_slice(&[0x00, 0x00]);
+        pkt.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        let record_len = 12 + fragment.len();
+        pkt.extend_from_slice(&(record_len as u16).to_be_bytes());
+
+        pkt.push(2);
+        pkt.extend_from_slice(&(full_body.len() as u32).to_be_bytes()[1..]);
+        pkt.extend_from_slice(&[0x00, 0x00]);
+        pkt.extend_from_slice(&(offset as u32).to_be_bytes()[1..]);
+        pkt.extend_from_slice(&(fragment.len() as u32).to_be_bytes()[1..]);
+        pkt.extend_from_slice(fragment);
+
+        pkt
+    }
+
+    fn fragmented_server_hello_handshake(full_body: &[u8], offset: usize, len: usize) -> Vec<u8> {
+        fragmented_server_hello_packet(full_body, offset, len)[13..].to_vec()
+    }
+
+    fn hello_verify_request_handshake(body: &[u8]) -> Vec<u8> {
+        let mut handshake = Vec::new();
+        handshake.push(3);
+        handshake.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        handshake.extend_from_slice(&[0x00, 0x00]);
+        handshake.extend_from_slice(&[0x00, 0x00, 0x00]);
+        handshake.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        handshake.extend_from_slice(body);
+        handshake
+    }
+
+    fn handshake_record(handshakes: &[Vec<u8>]) -> Vec<u8> {
+        let record_len: usize = handshakes.iter().map(Vec::len).sum();
+        let mut pkt = Vec::new();
+        pkt.push(0x16);
+        pkt.extend_from_slice(&[0xFE, 0xFD]);
+        pkt.extend_from_slice(&[0x00, 0x00]);
+        pkt.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        pkt.extend_from_slice(&(record_len as u16).to_be_bytes());
+        for handshake in handshakes {
+            pkt.extend_from_slice(handshake);
+        }
+        pkt
+    }
+
+    fn assert_record_header_variants_are_unknown(packet: Vec<u8>) {
+        let mut invalid_version = packet.clone();
+        invalid_version[1..3].copy_from_slice(&[0xFE, 0xFC]);
+        assert_eq!(
+            server_hello_version(&invalid_version),
+            DetectedVersion::Unknown
+        );
+
+        let mut nonzero_epoch = packet;
+        nonzero_epoch[3..5].copy_from_slice(&1u16.to_be_bytes());
+        assert_eq!(
+            server_hello_version(&nonzero_epoch),
+            DetectedVersion::Unknown
+        );
+    }
+
+    fn ignored_handshake_record() -> Vec<u8> {
+        handshake_record(&[make_empty_handshake(99)])
+    }
+
+    fn make_empty_handshake(msg_type: u8) -> Vec<u8> {
+        let mut handshake = Vec::new();
+        handshake.push(msg_type);
+        handshake.extend_from_slice(&[0x00, 0x00, 0x00]);
+        handshake.extend_from_slice(&[0x00, 0x00]);
+        handshake.extend_from_slice(&[0x00, 0x00, 0x00]);
+        handshake.extend_from_slice(&[0x00, 0x00, 0x00]);
+        handshake
+    }
+
     #[test]
     fn hello_verify_request_is_dtls12() {
         // Minimal HelloVerifyRequest packet
@@ -516,6 +1180,56 @@ mod tests {
         pkt[len_pos + 1] = record_len as u8;
 
         assert_eq!(server_hello_version(&pkt), DetectedVersion::Dtls12);
+    }
+
+    #[test]
+    fn hello_verify_request_dtls10_is_dtls12() {
+        let pkt = handshake_record(&[hello_verify_request_handshake(&[0xFE, 0xFF, 0x01, 0xAA])]);
+
+        assert_eq!(server_hello_version(&pkt), DetectedVersion::Dtls12);
+    }
+
+    #[test]
+    fn hello_verify_request_rejects_nonzero_message_seq() {
+        let mut pkt = handshake_record(&[hello_verify_request_handshake(&[
+            0xFE, 0xFD, 0x02, 0xAA, 0xBB,
+        ])]);
+        pkt[18] = 1;
+
+        assert_eq!(server_hello_version(&pkt), DetectedVersion::Unknown);
+    }
+
+    #[test]
+    fn hello_verify_request_rejects_empty_cookie() {
+        let pkt = handshake_record(&[hello_verify_request_handshake(&[0xFE, 0xFD, 0x00])]);
+
+        assert_eq!(server_hello_version(&pkt), DetectedVersion::Unknown);
+    }
+
+    #[test]
+    fn hello_verify_request_rejects_dtls13_version() {
+        let pkt = handshake_record(&[hello_verify_request_handshake(&[0xFE, 0xFC, 0x01, 0xAA])]);
+
+        assert_eq!(server_hello_version(&pkt), DetectedVersion::Unknown);
+    }
+
+    #[test]
+    fn hello_verify_request_rejects_malformed_record_header() {
+        let pkt = handshake_record(&[hello_verify_request_handshake(&[
+            0xFE, 0xFD, 0x02, 0xAA, 0xBB,
+        ])]);
+
+        assert_record_header_variants_are_unknown(pkt);
+    }
+
+    #[test]
+    fn hello_verify_request_rejects_opaque_tail() {
+        let mut pkt = handshake_record(&[hello_verify_request_handshake(&[
+            0xFE, 0xFD, 0x02, 0xAA, 0xBB,
+        ])]);
+        pkt.extend_from_slice(&[0x2E, 0x00, 0x28, 0x31, 0xD3, 0x00]);
+
+        assert_eq!(server_hello_version(&pkt), DetectedVersion::Unknown);
     }
 
     #[test]
@@ -577,6 +1291,538 @@ mod tests {
         pkt[len_pos + 1] = record_len as u8;
 
         assert_eq!(server_hello_version(&pkt), DetectedVersion::Dtls13);
+    }
+
+    #[test]
+    fn server_hello_accepts_opaque_dtls13_tail_after_version_evidence() {
+        let mut pkt = server_hello_packet_with_extensions(&[0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC]);
+        pkt.extend_from_slice(&[0x2E, 0x00, 0x28, 0x00, 0x01, 0x00]);
+
+        assert_eq!(server_hello_version(&pkt), DetectedVersion::Dtls13);
+    }
+
+    #[test]
+    fn server_hello_rejects_non_ciphertext_opaque_tail_after_version_evidence() {
+        for tail in [&[0x15][..], &[0xFF, 0x00][..]] {
+            let mut pkt =
+                server_hello_packet_with_extensions(&[0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC]);
+            pkt.extend_from_slice(tail);
+
+            assert_eq!(server_hello_version(&pkt), DetectedVersion::Unknown);
+        }
+    }
+
+    #[test]
+    fn server_hello_rejects_malformed_record_header() {
+        let pkt = server_hello_packet_with_extensions(&[0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC]);
+
+        assert_record_header_variants_are_unknown(pkt);
+    }
+
+    #[test]
+    fn server_hello_without_supported_versions_rejects_opaque_tail() {
+        let mut pkt = server_hello_packet_with_extensions(&[]);
+        pkt.extend_from_slice(&[0x2E, 0x00, 0x28, 0x31, 0xD3, 0x00]);
+
+        assert_eq!(server_hello_version(&pkt), DetectedVersion::Unknown);
+    }
+
+    #[test]
+    fn server_hello_rejects_truncated_supported_versions_extension() {
+        let pkt = server_hello_packet_with_extensions(&[0x00, 0x2B, 0x00, 0x02]);
+
+        assert_eq!(server_hello_version(&pkt), DetectedVersion::Unknown);
+    }
+
+    #[test]
+    fn server_hello_rejects_short_supported_versions_extension() {
+        for ext_body in [&[][..], &[0xFE][..]] {
+            let mut extensions = Vec::new();
+            extensions.extend_from_slice(&[0x00, 0x2B]);
+            extensions.extend_from_slice(&(ext_body.len() as u16).to_be_bytes());
+            extensions.extend_from_slice(ext_body);
+
+            assert_eq!(
+                server_hello_version(&server_hello_packet_with_extensions(&extensions)),
+                DetectedVersion::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn server_hello_rejects_long_supported_versions_extension() {
+        let pkt = server_hello_packet_with_extensions(&[0x00, 0x2B, 0x00, 0x03, 0xFE, 0xFC, 0x00]);
+
+        assert_eq!(server_hello_version(&pkt), DetectedVersion::Unknown);
+    }
+
+    #[test]
+    fn server_hello_rejects_unsupported_selected_versions() {
+        for selected in [[0xFE, 0xFD], [0xFE, 0xFB], [0x03, 0x04]] {
+            let pkt = server_hello_packet_with_extensions(&[
+                0x00,
+                0x2B,
+                0x00,
+                0x02,
+                selected[0],
+                selected[1],
+            ]);
+
+            assert_eq!(server_hello_version(&pkt), DetectedVersion::Unknown);
+        }
+    }
+
+    #[test]
+    fn server_hello_rejects_duplicate_supported_versions() {
+        let pkt = server_hello_packet_with_extensions(&[
+            0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC, 0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC,
+        ]);
+
+        assert_eq!(server_hello_version(&pkt), DetectedVersion::Unknown);
+    }
+
+    #[test]
+    fn server_hello_rejects_truncated_fixed_body_fields() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0xFE, 0xFD]); // legacy version DTLS 1.2
+        body.extend_from_slice(&[0u8; 32]); // random
+
+        assert_eq!(
+            server_hello_version(&server_hello_packet_with_body(&body)),
+            DetectedVersion::Unknown
+        );
+
+        body.push(0x04); // session_id length, but no session id
+        assert_eq!(
+            server_hello_version(&server_hello_packet_with_body(&body)),
+            DetectedVersion::Unknown
+        );
+
+        body[34] = 0x00; // empty session id, but no cipher suite
+        assert_eq!(
+            server_hello_version(&server_hello_packet_with_body(&body)),
+            DetectedVersion::Unknown
+        );
+
+        body.push(0x13); // partial cipher suite
+        assert_eq!(
+            server_hello_version(&server_hello_packet_with_body(&body)),
+            DetectedVersion::Unknown
+        );
+
+        body.push(0x01); // complete cipher suite, missing compression method
+        assert_eq!(
+            server_hello_version(&server_hello_packet_with_body(&body)),
+            DetectedVersion::Unknown
+        );
+    }
+
+    #[test]
+    fn server_hello_rejects_invalid_legacy_version() {
+        for extensions in [&[][..], &[0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC][..]] {
+            let mut body = server_hello_body_with_extensions(extensions);
+            body[0..2].copy_from_slice(&[0xFE, 0xFC]);
+
+            assert_eq!(
+                server_hello_version(&server_hello_packet_with_body(&body)),
+                DetectedVersion::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn server_hello_rejects_non_null_compression() {
+        for extensions in [&[][..], &[0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC][..]] {
+            let mut body = server_hello_body_with_extensions(extensions);
+            let compression_pos = 2 + 32 + 1 + 2;
+            body[compression_pos] = 1;
+
+            assert_eq!(
+                server_hello_version(&server_hello_packet_with_body(&body)),
+                DetectedVersion::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn server_hello_rejects_incomplete_handshake_fragments() {
+        let pkt = server_hello_packet_with_extensions(&[0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC]);
+        assert_eq!(server_hello_version(&pkt), DetectedVersion::Dtls13);
+
+        let body = pkt[25..].to_vec();
+        let nonzero_offset = fragmented_server_hello_packet(&body, 1, body.len() - 1);
+        assert_eq!(
+            server_hello_version(&nonzero_offset),
+            DetectedVersion::Incomplete
+        );
+
+        let mut partial_fragment = pkt;
+        partial_fragment[16] += 1; // handshake length declares one byte beyond this fragment
+        assert_eq!(
+            server_hello_version(&partial_fragment),
+            DetectedVersion::Incomplete
+        );
+    }
+
+    #[test]
+    fn server_hello_partial_first_fragment_waits_for_full_validation() {
+        let mut pkt = server_hello_packet_with_extensions(&[
+            0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC, // supported_versions
+            0x00, 0x15, 0x00, 0x00, // padding extension header
+        ]);
+        let full_body_len =
+            ((pkt[14] as usize) << 16) | ((pkt[15] as usize) << 8) | pkt[16] as usize;
+        let partial_body_len = full_body_len - 4;
+        let record_len = 12 + partial_body_len;
+
+        pkt[11..13].copy_from_slice(&(record_len as u16).to_be_bytes());
+        pkt[22] = 0;
+        pkt[23] = (partial_body_len >> 8) as u8;
+        pkt[24] = partial_body_len as u8;
+        pkt.truncate(13 + record_len);
+
+        assert_eq!(server_hello_version(&pkt), DetectedVersion::Incomplete);
+    }
+
+    #[test]
+    fn server_hello_rejects_malformed_tail_after_reassembled_partial_version_evidence() {
+        let full = server_hello_packet_with_extensions(&[
+            0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC, // supported_versions
+            0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC, // duplicate supported_versions
+        ]);
+        let body = full[25..].to_vec();
+        let split = body.len() - 6;
+
+        let first = fragmented_server_hello_packet(&body, 0, split);
+        let second = fragmented_server_hello_packet(&body, split, body.len() - split);
+        assert_eq!(
+            server_hello_version_from_fragments([first.as_slice(), second.as_slice()]),
+            DetectedVersion::Unknown
+        );
+
+        let datagram = handshake_record(&[
+            fragmented_server_hello_handshake(&body, 0, split),
+            fragmented_server_hello_handshake(&body, split, body.len() - split),
+        ]);
+        assert_eq!(server_hello_version(&datagram), DetectedVersion::Unknown);
+    }
+
+    #[test]
+    fn server_hello_conflicting_queued_fragment_blocks_fast_path() {
+        let full = server_hello_packet_with_extensions(&[
+            0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC, // supported_versions
+            0x00, 0x15, 0x00, 0x00, // padding extension header
+        ]);
+        let body = full[25..].to_vec();
+        let first = fragmented_server_hello_packet(&body, 0, body.len() - 4);
+        let mut conflicting_body = body.clone();
+        conflicting_body[0] ^= 1;
+        let conflicting = fragmented_server_hello_packet(&conflicting_body, 0, body.len());
+
+        assert_eq!(
+            server_hello_version_from_fragments([first.as_slice(), conflicting.as_slice()]),
+            DetectedVersion::Unknown
+        );
+    }
+
+    #[test]
+    fn server_hello_mismatched_queued_length_blocks_fast_path() {
+        let full = server_hello_packet_with_extensions(&[
+            0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC, // supported_versions
+            0x00, 0x15, 0x00, 0x00, // padding extension header
+        ]);
+        let body = full[25..].to_vec();
+        let first = fragmented_server_hello_packet(&body, 0, body.len() - 4);
+        let mut mismatched = fragmented_server_hello_packet(&body, 0, body.len());
+        let mismatched_len = body.len() + 1;
+        mismatched[14..17].copy_from_slice(&(mismatched_len as u32).to_be_bytes()[1..]);
+
+        assert_eq!(
+            server_hello_version_from_fragments([first.as_slice(), mismatched.as_slice()]),
+            DetectedVersion::Unknown
+        );
+    }
+
+    #[test]
+    fn server_hello_partial_first_fragment_without_version_is_incomplete() {
+        let mut pkt = server_hello_packet_with_extensions(&[0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC]);
+        let partial_body_len = 34;
+        let record_len = 12 + partial_body_len;
+
+        pkt[11..13].copy_from_slice(&(record_len as u16).to_be_bytes());
+        pkt[22] = 0;
+        pkt[23] = (partial_body_len >> 8) as u8;
+        pkt[24] = partial_body_len as u8;
+        pkt.truncate(13 + record_len);
+
+        assert_eq!(server_hello_version(&pkt), DetectedVersion::Incomplete);
+    }
+
+    #[test]
+    fn server_hello_multirecord_fragments_can_select_dtls13() {
+        let full = server_hello_packet_with_extensions(&[0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC]);
+        let body = full[25..].to_vec();
+        let split = 34;
+        let mut datagram = fragmented_server_hello_packet(&body, 0, split);
+        datagram.extend_from_slice(&fragmented_server_hello_packet(
+            &body,
+            split,
+            body.len() - split,
+        ));
+
+        assert_eq!(server_hello_version(&datagram), DetectedVersion::Dtls13);
+    }
+
+    #[test]
+    fn server_hello_single_record_multiple_fragments_can_select_dtls13() {
+        let full = server_hello_packet_with_extensions(&[0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC]);
+        let body = full[25..].to_vec();
+        let split = 34;
+        let datagram = handshake_record(&[
+            fragmented_server_hello_handshake(&body, 0, split),
+            fragmented_server_hello_handshake(&body, split, body.len() - split),
+        ]);
+
+        assert_eq!(server_hello_version(&datagram), DetectedVersion::Dtls13);
+    }
+
+    #[test]
+    fn server_hello_malformed_hvr_tail_does_not_force_dtls12() {
+        let full = server_hello_packet_with_extensions(&[0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC]);
+        let body = full[25..].to_vec();
+        let mut malformed_hvr = Vec::new();
+        malformed_hvr.push(3);
+        malformed_hvr.extend_from_slice(&[0x00, 0x00, 0x05]);
+        malformed_hvr.extend_from_slice(&[0x00, 0x00]);
+        malformed_hvr.extend_from_slice(&[0x00, 0x00, 0x00]);
+        malformed_hvr.extend_from_slice(&[0x00, 0x00, 0x05]);
+
+        let datagram = handshake_record(&[
+            fragmented_server_hello_handshake(&body, 0, body.len()),
+            malformed_hvr,
+        ]);
+
+        assert_eq!(server_hello_version(&datagram), DetectedVersion::Unknown);
+    }
+
+    #[test]
+    fn server_hello_valid_hvr_tail_is_unknown() {
+        let full = server_hello_packet_with_extensions(&[0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC]);
+        let body = full[25..].to_vec();
+        let datagram = handshake_record(&[
+            fragmented_server_hello_handshake(&body, 0, body.len()),
+            hello_verify_request_handshake(&[0xFE, 0xFD, 0x02, 0xAA, 0xBB]),
+        ]);
+
+        assert_eq!(server_hello_version(&datagram), DetectedVersion::Unknown);
+    }
+
+    #[test]
+    fn server_hello_valid_hvr_prefix_is_unknown() {
+        let full = server_hello_packet_with_extensions(&[0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC]);
+        let body = full[25..].to_vec();
+        let datagram = handshake_record(&[
+            hello_verify_request_handshake(&[0xFE, 0xFD, 0x02, 0xAA, 0xBB]),
+            fragmented_server_hello_handshake(&body, 0, body.len()),
+        ]);
+
+        assert_eq!(server_hello_version(&datagram), DetectedVersion::Unknown);
+    }
+
+    #[test]
+    fn server_hello_valid_hvr_prefix_across_records_is_unknown() {
+        let full = server_hello_packet_with_extensions(&[0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC]);
+        let body = full[25..].to_vec();
+        let mut datagram = handshake_record(&[hello_verify_request_handshake(&[
+            0xFE, 0xFD, 0x02, 0xAA, 0xBB,
+        ])]);
+        datagram.extend_from_slice(&fragmented_server_hello_packet(&body, 0, body.len()));
+
+        assert_eq!(server_hello_version(&datagram), DetectedVersion::Unknown);
+    }
+
+    #[test]
+    fn server_hello_rejects_too_many_records() {
+        let mut datagram = Vec::new();
+        for _ in 0..=MAX_SERVER_HELLO_RECORDS_PER_PACKET {
+            datagram.extend_from_slice(&ignored_handshake_record());
+        }
+
+        assert_eq!(server_hello_version(&datagram), DetectedVersion::Unknown);
+    }
+
+    #[test]
+    fn server_hello_rejects_too_many_fragments() {
+        let mut body = vec![0u8; MAX_SERVER_HELLO_FRAGMENTS + 1];
+        body[0..2].copy_from_slice(&[0xFE, 0xFD]);
+
+        let packets: Vec<_> = (0..=MAX_SERVER_HELLO_FRAGMENTS)
+            .map(|offset| fragmented_server_hello_packet(&body, offset, 1))
+            .collect();
+
+        assert_eq!(
+            server_hello_version_from_fragments(packets.iter().map(Vec::as_slice)),
+            DetectedVersion::Unknown
+        );
+    }
+
+    #[test]
+    fn pending_server_response_rejects_oversized_incomplete_packet() {
+        let config = Arc::new(Config::builder().build().expect("config"));
+        let certificate = DtlsCertificate {
+            certificate: vec![1],
+            private_key: vec![1],
+        };
+        let mut pending =
+            ClientPending::new(config, certificate, Instant::now()).expect("pending client");
+
+        let full = server_hello_packet_with_extensions(&[0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC]);
+        let body = full[25..].to_vec();
+        let mut packet = fragmented_server_hello_packet(&body, 0, 34);
+        packet.extend_from_slice(&{
+            let mut tail = Vec::new();
+            tail.push(0x17);
+            tail.extend_from_slice(&[0xFE, 0xFD]);
+            tail.extend_from_slice(&[0x00, 0x00]);
+            tail.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+            tail.extend_from_slice(&(MAX_PENDING_SERVER_RESPONSE_BYTES as u16).to_be_bytes());
+            tail.resize(13 + MAX_PENDING_SERVER_RESPONSE_BYTES, 0);
+            tail
+        });
+
+        assert_eq!(server_hello_version(&packet), DetectedVersion::Unknown);
+        assert!(matches!(
+            pending.push_server_response_fragment(&packet),
+            Err(Error::TooManyServerHelloFragments)
+        ));
+        assert!(pending.server_response_fragments.is_empty());
+    }
+
+    #[test]
+    fn duplicate_retransmitted_fragment_does_not_consume_buffer_slot() {
+        let full = server_hello_packet_with_extensions(&[0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC]);
+        let body = full[25..].to_vec();
+        let fragment = fragmented_server_hello_packet(&body, 0, 34);
+        let mut retransmit = fragment.clone();
+        retransmit[10] ^= 1; // record sequence differs, handshake fragment does not
+
+        let mut queued = ArrayVec::<Buf, MAX_PENDING_SERVER_RESPONSE_PACKETS>::new();
+        let mut buf = Buf::new();
+        buf.extend_from_slice(&fragment);
+        queued.push(buf);
+
+        assert!(!packet_has_new_server_hello_fragment(&queued, &retransmit));
+    }
+
+    #[test]
+    fn server_hello_rejects_overlong_session_id() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0xFE, 0xFD]); // legacy version DTLS 1.2
+        body.extend_from_slice(&[0u8; 32]); // random
+        body.push(33); // session_id length exceeds protocol maximum
+        body.extend_from_slice(&[0u8; 33]);
+        body.extend_from_slice(&[0x13, 0x01]); // cipher_suite AES_128_GCM_SHA256
+        body.push(0x00); // compression_method = null
+        body.extend_from_slice(&6u16.to_be_bytes());
+        body.extend_from_slice(&[0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC]);
+
+        assert_eq!(
+            server_hello_version(&server_hello_packet_with_body(&body)),
+            DetectedVersion::Unknown
+        );
+    }
+
+    #[test]
+    fn server_hello_rejects_one_byte_extensions_length() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0xFE, 0xFD]); // legacy version DTLS 1.2
+        body.extend_from_slice(&[0u8; 32]); // random
+        body.push(0x00); // session_id length = 0
+        body.extend_from_slice(&[0x13, 0x01]); // cipher_suite AES_128_GCM_SHA256
+        body.push(0x00); // compression_method = null
+        body.push(0x00); // truncated extensions length
+
+        assert_eq!(
+            server_hello_version(&server_hello_packet_with_body(&body)),
+            DetectedVersion::Unknown
+        );
+    }
+
+    #[test]
+    fn server_hello_rejects_trailing_bytes_after_extensions_vector() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0xFE, 0xFD]); // legacy version DTLS 1.2
+        body.extend_from_slice(&[0u8; 32]); // random
+        body.push(0x00); // session_id length = 0
+        body.extend_from_slice(&[0x13, 0x01]); // cipher_suite AES_128_GCM_SHA256
+        body.push(0x00); // compression_method = null
+        body.extend_from_slice(&0u16.to_be_bytes()); // extensions length = 0
+        body.extend_from_slice(&[0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC]); // trailing bytes
+
+        assert_eq!(
+            server_hello_version(&server_hello_packet_with_body(&body)),
+            DetectedVersion::Unknown
+        );
+    }
+
+    #[test]
+    fn server_hello_rejects_trailing_bytes_after_valid_supported_versions_vector() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0xFE, 0xFD]); // legacy version DTLS 1.2
+        body.extend_from_slice(&[0u8; 32]); // random
+        body.push(0x00); // session_id length = 0
+        body.extend_from_slice(&[0x13, 0x01]); // cipher_suite AES_128_GCM_SHA256
+        body.push(0x00); // compression_method = null
+        body.extend_from_slice(&6u16.to_be_bytes()); // declared extensions length
+        body.extend_from_slice(&[0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC]); // supported_versions
+        body.push(0x00); // trailing byte outside declared vector
+
+        assert_eq!(
+            server_hello_version(&server_hello_packet_with_body(&body)),
+            DetectedVersion::Unknown
+        );
+    }
+
+    #[test]
+    fn server_hello_rejects_oversized_extensions_vector() {
+        let mut pkt = server_hello_packet_with_extensions(&[]);
+        let ext_len_pos = pkt.len() - 2;
+
+        pkt[ext_len_pos..].copy_from_slice(&4u16.to_be_bytes());
+
+        assert_eq!(server_hello_version(&pkt), DetectedVersion::Unknown);
+    }
+
+    #[test]
+    fn server_hello_rejects_trailing_partial_extension_header() {
+        for trailing in [&[0x00][..], &[0x00, 0x2B][..], &[0x00, 0x2B, 0x00][..]] {
+            assert_eq!(
+                server_hello_version(&server_hello_packet_with_extensions(trailing)),
+                DetectedVersion::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn server_hello_rejects_malformed_tail_after_supported_versions() {
+        for trailing in [&[0x00][..], &[0x00, 0x2B][..], &[0x00, 0x2B, 0x00][..]] {
+            let mut extensions = vec![0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC];
+            extensions.extend_from_slice(trailing);
+
+            assert_eq!(
+                server_hello_version(&server_hello_packet_with_extensions(&extensions)),
+                DetectedVersion::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn server_hello_rejects_oversized_extension_after_supported_versions() {
+        let pkt = server_hello_packet_with_extensions(&[
+            0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC, 0x00, 0x0A, 0x00, 0x04, 0x01, 0x02,
+        ]);
+
+        assert_eq!(server_hello_version(&pkt), DetectedVersion::Unknown);
     }
 
     #[test]

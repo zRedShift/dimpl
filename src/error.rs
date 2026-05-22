@@ -43,6 +43,9 @@ pub enum Error {
     /// If we are in auto-sense mode for a server and we received too
     /// many client hello fragments that haven't made a packet.
     TooManyClientHelloFragments,
+    /// Auto-sense client received too many incomplete ServerHello fragments
+    /// before the DTLS version could be resolved.
+    TooManyServerHelloFragments,
     /// The DTLS 1.3 server received a ClientHello that does not offer
     /// DTLS 1.3 in `supported_versions`. In auto-sense mode the caller
     /// should fall back to a DTLS 1.2 server and replay the buffered
@@ -87,6 +90,7 @@ impl std::fmt::Display for Error {
                 write!(f, "handshake pending: cannot send application data yet")
             }
             Error::TooManyClientHelloFragments => write!(f, "too many client hello fragments"),
+            Error::TooManyServerHelloFragments => write!(f, "too many server hello fragments"),
             Error::ConnectionClosed => write!(f, "connection closed"),
             Error::Dtls12Fallback => {
                 write!(f, "dtls 1.2 fallback (internal)")

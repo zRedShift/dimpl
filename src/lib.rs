@@ -635,10 +635,36 @@ impl Dtls {
 
     fn handle_pending_auto_client(&mut self, packet: &[u8]) -> Result<(), Error> {
         // Auto-sense client: resolve version on first server response
-        let version = auto::server_hello_version(packet);
+        let mut version = auto::server_hello_version(packet);
+        let replay_current_packet;
 
         // Check version before taking inner — returning an error
         // while inner is None would leave us unable to poll/timeout.
+        if matches!(version, auto::DetectedVersion::Incomplete) {
+            let Inner::ClientPending(cp) = self.inner.as_mut().unwrap() else {
+                unreachable!()
+            };
+            version = cp.push_server_response_fragment(packet)?;
+            if matches!(version, auto::DetectedVersion::Incomplete) {
+                return Ok(());
+            }
+            replay_current_packet = false;
+        } else if matches!(version, auto::DetectedVersion::Dtls12) {
+            let Inner::ClientPending(cp) = self.inner.as_mut().unwrap() else {
+                unreachable!()
+            };
+            if cp.has_server_response_fragments() {
+                version = cp.push_server_response_fragment(packet)?;
+                if matches!(version, auto::DetectedVersion::Incomplete) {
+                    return Ok(());
+                }
+                replay_current_packet = false;
+            } else {
+                replay_current_packet = true;
+            }
+        } else {
+            replay_current_packet = true;
+        }
         if matches!(version, auto::DetectedVersion::Unknown) {
             return Err(Error::UnexpectedMessage(
                 "Unrecognized response from server".to_string(),
@@ -650,7 +676,7 @@ impl Dtls {
         let Inner::ClientPending(cp) = inner else {
             unreachable!()
         };
-        let (hybrid, config, certificate, now) = cp.into_parts();
+        let (hybrid, config, certificate, now, buffered_server_responses) = cp.into_parts();
         match version {
             auto::DetectedVersion::Dtls12 => {
                 let mut client12 = Client12::new_from_hybrid(
@@ -660,25 +686,41 @@ impl Dtls {
                     certificate,
                     now,
                 )?;
-                // Feed the HVR to Client12 — it enters
-                // AwaitHelloVerifyRequest and processes the cookie.
-                if let Err(e) = client12.handle_packet(packet) {
-                    self.inner = Some(Inner::Client12(client12));
-                    return Err(e);
+                for buffered in &buffered_server_responses {
+                    if let Err(e) = client12.handle_packet(buffered) {
+                        self.inner = Some(Inner::Client12(client12));
+                        return Err(e);
+                    }
+                }
+                if replay_current_packet {
+                    // Feed the HVR/current ServerHello to Client12 — it enters
+                    // AwaitHelloVerifyRequest and processes the cookie.
+                    if let Err(e) = client12.handle_packet(packet) {
+                        self.inner = Some(Inner::Client12(client12));
+                        return Err(e);
+                    }
                 }
                 self.inner = Some(Inner::Client12(client12));
                 Ok(())
             }
             auto::DetectedVersion::Dtls13 => {
                 let mut client13 = Client13::new_from_hybrid(hybrid, config, certificate, now)?;
-                if let Err(e) = client13.handle_packet(packet) {
-                    self.inner = Some(Inner::Client13(client13));
-                    return Err(e);
+                for buffered in &buffered_server_responses {
+                    if let Err(e) = client13.handle_packet(buffered) {
+                        self.inner = Some(Inner::Client13(client13));
+                        return Err(e);
+                    }
+                }
+                if replay_current_packet {
+                    if let Err(e) = client13.handle_packet(packet) {
+                        self.inner = Some(Inner::Client13(client13));
+                        return Err(e);
+                    }
                 }
                 self.inner = Some(Inner::Client13(client13));
                 Ok(())
             }
-            auto::DetectedVersion::Unknown => unreachable!(),
+            auto::DetectedVersion::Incomplete | auto::DetectedVersion::Unknown => unreachable!(),
         }
     }
 
@@ -1159,6 +1201,352 @@ mod test {
         body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
         body.extend_from_slice(extensions);
         body
+    }
+
+    fn dtls13_server_hello_body() -> Vec<u8> {
+        let mut full_body = Vec::new();
+        full_body.extend_from_slice(&[0xFE, 0xFD]); // legacy version DTLS 1.2
+        full_body.extend_from_slice(&[0u8; 32]); // random
+        full_body.push(0); // session_id length
+        full_body.extend_from_slice(&[0x13, 0x01]); // cipher_suite AES_128_GCM_SHA256
+        full_body.push(0); // compression_method
+        full_body.extend_from_slice(&6u16.to_be_bytes());
+        full_body.extend_from_slice(&[0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC]);
+        full_body
+    }
+
+    fn server_hello_fragment(full_body: &[u8], offset: usize, len: usize) -> Vec<u8> {
+        let fragment = &full_body[offset..offset + len];
+        let hs = make_handshake(
+            0x02,
+            full_body.len() as u32,
+            offset as u32,
+            fragment.len() as u32,
+            fragment,
+        );
+        make_record(0x16, &hs)
+    }
+
+    fn server_hello_handshake_fragment(full_body: &[u8], offset: usize, len: usize) -> Vec<u8> {
+        let fragment = &full_body[offset..offset + len];
+        make_handshake(
+            0x02,
+            full_body.len() as u32,
+            offset as u32,
+            fragment.len() as u32,
+            fragment,
+        )
+    }
+
+    fn hello_verify_request_handshake(body: &[u8]) -> Vec<u8> {
+        make_handshake(0x03, body.len() as u32, 0, body.len() as u32, body)
+    }
+
+    fn assert_auto_client_rejects_without_committing(packet: &[u8]) {
+        let mut dtls = new_instance_auto();
+        dtls.set_active(true);
+        let now = Instant::now();
+        dtls.handle_timeout(now).unwrap();
+
+        let mut buf = [0u8; 2048];
+        loop {
+            if matches!(dtls.poll_output(&mut buf), Output::Timeout(_)) {
+                break;
+            }
+        }
+
+        let result = dtls.handle_packet(packet);
+        assert!(
+            matches!(result, Err(Error::UnexpectedMessage(_))),
+            "malformed server response must be rejected before committing auto client: {result:?}"
+        );
+        assert!(matches!(dtls.inner, Some(Inner::ClientPending(_))));
+        assert_eq!(dtls.protocol_version(), None);
+    }
+
+    fn assert_auto_client_rejects_malformed_record_header_without_committing(packet: &[u8]) {
+        let mut invalid_version = packet.to_vec();
+        invalid_version[1..3].copy_from_slice(&[0xFE, 0xFC]);
+        assert_auto_client_rejects_without_committing(&invalid_version);
+
+        let mut nonzero_epoch = packet.to_vec();
+        nonzero_epoch[3..5].copy_from_slice(&1u16.to_be_bytes());
+        assert_auto_client_rejects_without_committing(&nonzero_epoch);
+    }
+
+    fn partial_dtls13_server_hello_fragment_without_version_evidence() -> Vec<u8> {
+        let full_body = dtls13_server_hello_body();
+        let partial_body = &full_body[..34];
+        server_hello_fragment(&full_body, 0, partial_body.len())
+    }
+
+    fn fragmented_dtls13_server_hello_without_first_fragment_version_evidence() -> (Vec<u8>, Vec<u8>)
+    {
+        let full_body = dtls13_server_hello_body();
+        let split = 34;
+        (
+            server_hello_fragment(&full_body, 0, split),
+            server_hello_fragment(&full_body, split, full_body.len() - split),
+        )
+    }
+
+    fn fragmented_dtls13_server_hello_in_one_record_without_first_fragment_version_evidence()
+    -> Vec<u8> {
+        let full_body = dtls13_server_hello_body();
+        let split = 34;
+        let mut handshakes = server_hello_handshake_fragment(&full_body, 0, split);
+        handshakes.extend_from_slice(&server_hello_handshake_fragment(
+            &full_body,
+            split,
+            full_body.len() - split,
+        ));
+        make_record(0x16, &handshakes)
+    }
+
+    #[test]
+    fn test_auto_client_incomplete_server_hello_keeps_pending() {
+        let mut dtls = new_instance_auto();
+        dtls.set_active(true);
+        let now = Instant::now();
+        dtls.handle_timeout(now).unwrap();
+
+        let mut buf = [0u8; 2048];
+        loop {
+            if matches!(dtls.poll_output(&mut buf), Output::Timeout(_)) {
+                break;
+            }
+        }
+
+        let partial = partial_dtls13_server_hello_fragment_without_version_evidence();
+        dtls.handle_packet(&partial).unwrap();
+
+        assert!(matches!(dtls.inner, Some(Inner::ClientPending(_))));
+        assert_eq!(dtls.protocol_version(), None);
+    }
+
+    #[test]
+    fn test_auto_client_rejects_hvr_server_hello_mix_without_committing() {
+        let mut dtls = new_instance_auto();
+        dtls.set_active(true);
+        let now = Instant::now();
+        dtls.handle_timeout(now).unwrap();
+
+        let mut buf = [0u8; 2048];
+        loop {
+            if matches!(dtls.poll_output(&mut buf), Output::Timeout(_)) {
+                break;
+            }
+        }
+
+        let full_body = dtls13_server_hello_body();
+        let mut handshakes = hello_verify_request_handshake(&[0xFE, 0xFD, 0x02, 0xAA, 0xBB]);
+        handshakes.extend_from_slice(&server_hello_handshake_fragment(
+            &full_body,
+            0,
+            full_body.len(),
+        ));
+        let mixed = make_record(0x16, &handshakes);
+
+        let result = dtls.handle_packet(&mixed);
+        assert!(
+            matches!(result, Err(Error::UnexpectedMessage(_))),
+            "mixed HVR/ServerHello must be rejected before committing auto client: {result:?}"
+        );
+        assert!(matches!(dtls.inner, Some(Inner::ClientPending(_))));
+        assert_eq!(dtls.protocol_version(), None);
+    }
+
+    #[test]
+    fn test_auto_client_rejects_invalid_hvr_without_committing() {
+        let empty_cookie_hvr =
+            make_record(0x16, &hello_verify_request_handshake(&[0xFE, 0xFD, 0x00]));
+
+        assert_auto_client_rejects_without_committing(&empty_cookie_hvr);
+    }
+
+    #[test]
+    fn test_auto_client_rejects_nonzero_hvr_seq_without_committing() {
+        let mut hvr = hello_verify_request_handshake(&[0xFE, 0xFD, 0x02, 0xAA, 0xBB]);
+        hvr[5] = 1;
+        let hvr = make_record(0x16, &hvr);
+
+        assert_auto_client_rejects_without_committing(&hvr);
+    }
+
+    #[test]
+    fn test_auto_client_rejects_malformed_server_hello_fixed_fields_without_committing() {
+        let mut invalid_version = dtls13_server_hello_body();
+        invalid_version[0..2].copy_from_slice(&[0xFE, 0xFC]);
+        assert_auto_client_rejects_without_committing(&server_hello_fragment(
+            &invalid_version,
+            0,
+            invalid_version.len(),
+        ));
+
+        let mut invalid_compression = dtls13_server_hello_body();
+        let compression_pos = 2 + 32 + 1 + 2;
+        invalid_compression[compression_pos] = 1;
+        assert_auto_client_rejects_without_committing(&server_hello_fragment(
+            &invalid_compression,
+            0,
+            invalid_compression.len(),
+        ));
+    }
+
+    #[test]
+    fn test_auto_client_rejects_malformed_record_headers_without_committing() {
+        let full_body = dtls13_server_hello_body();
+        let server_hello = server_hello_fragment(&full_body, 0, full_body.len());
+        assert_auto_client_rejects_malformed_record_header_without_committing(&server_hello);
+
+        let hvr = make_record(
+            0x16,
+            &hello_verify_request_handshake(&[0xFE, 0xFD, 0x02, 0xAA, 0xBB]),
+        );
+        assert_auto_client_rejects_malformed_record_header_without_committing(&hvr);
+    }
+
+    #[test]
+    fn test_auto_client_rejects_reassembled_malformed_server_hello_without_committing() {
+        let mut body = dtls13_server_hello_body();
+        body[40..42].copy_from_slice(&12u16.to_be_bytes());
+        body.extend_from_slice(&[0x00, 0x2B, 0x00, 0x02, 0xFE, 0xFC]);
+
+        let split = body.len() - 6;
+        let mut handshakes = server_hello_handshake_fragment(&body, 0, split);
+        handshakes.extend_from_slice(&server_hello_handshake_fragment(
+            &body,
+            split,
+            body.len() - split,
+        ));
+        let packet = make_record(0x16, &handshakes);
+
+        assert_auto_client_rejects_without_committing(&packet);
+    }
+
+    #[test]
+    fn test_auto_client_rejects_buffered_server_hello_then_hvr_without_committing() {
+        let mut dtls = new_instance_auto();
+        dtls.set_active(true);
+        let now = Instant::now();
+        dtls.handle_timeout(now).unwrap();
+
+        let mut buf = [0u8; 2048];
+        loop {
+            if matches!(dtls.poll_output(&mut buf), Output::Timeout(_)) {
+                break;
+            }
+        }
+
+        let partial = partial_dtls13_server_hello_fragment_without_version_evidence();
+        dtls.handle_packet(&partial).unwrap();
+        assert!(matches!(dtls.inner, Some(Inner::ClientPending(_))));
+
+        let hvr = make_record(
+            0x16,
+            &hello_verify_request_handshake(&[0xFE, 0xFD, 0x02, 0xAA, 0xBB]),
+        );
+        let result = dtls.handle_packet(&hvr);
+        assert!(
+            matches!(result, Err(Error::UnexpectedMessage(_))),
+            "buffered ServerHello evidence plus HVR must not commit to DTLS 1.2: {result:?}"
+        );
+        assert!(matches!(dtls.inner, Some(Inner::ClientPending(_))));
+        assert_eq!(dtls.protocol_version(), None);
+    }
+
+    #[test]
+    fn test_auto_client_fragmented_server_hello_eventually_resolves_version() {
+        let mut dtls = new_instance_auto();
+        dtls.set_active(true);
+        let now = Instant::now();
+        dtls.handle_timeout(now).unwrap();
+
+        let mut buf = [0u8; 2048];
+        loop {
+            if matches!(dtls.poll_output(&mut buf), Output::Timeout(_)) {
+                break;
+            }
+        }
+
+        let (first, second) =
+            fragmented_dtls13_server_hello_without_first_fragment_version_evidence();
+        dtls.handle_packet(&first).unwrap();
+        assert!(matches!(dtls.inner, Some(Inner::ClientPending(_))));
+
+        let result = dtls.handle_packet(&second);
+        assert!(
+            matches!(
+                result,
+                Err(Error::SecurityError(ref message))
+                    if message == "Server did not provide key_share extension"
+            ),
+            "synthetic ServerHello should replay into DTLS 1.3 and fail only because the fixture omits key_share: {result:?}"
+        );
+        assert!(matches!(dtls.inner, Some(Inner::Client13(_))));
+        assert_eq!(dtls.protocol_version(), Some(ProtocolVersion::DTLS1_3));
+    }
+
+    #[test]
+    fn test_auto_client_single_record_fragmented_server_hello_resolves_version() {
+        let mut dtls = new_instance_auto();
+        dtls.set_active(true);
+        let now = Instant::now();
+        dtls.handle_timeout(now).unwrap();
+
+        let mut buf = [0u8; 2048];
+        loop {
+            if matches!(dtls.poll_output(&mut buf), Output::Timeout(_)) {
+                break;
+            }
+        }
+
+        let packet =
+            fragmented_dtls13_server_hello_in_one_record_without_first_fragment_version_evidence();
+        let result = dtls.handle_packet(&packet);
+        assert!(
+            matches!(
+                result,
+                Err(Error::SecurityError(ref message))
+                    if message == "Server did not provide key_share extension"
+            ),
+            "single-record fragmented synthetic ServerHello should replay into DTLS 1.3 and fail only because the fixture omits key_share: {result:?}"
+        );
+        assert!(matches!(dtls.inner, Some(Inner::Client13(_))));
+        assert_eq!(dtls.protocol_version(), Some(ProtocolVersion::DTLS1_3));
+    }
+
+    #[test]
+    fn test_auto_client_replays_resolving_server_hello_after_buffered_fragment() {
+        let mut dtls = new_instance_auto();
+        dtls.set_active(true);
+        let now = Instant::now();
+        dtls.handle_timeout(now).unwrap();
+
+        let mut buf = [0u8; 2048];
+        loop {
+            if matches!(dtls.poll_output(&mut buf), Output::Timeout(_)) {
+                break;
+            }
+        }
+
+        let partial = partial_dtls13_server_hello_fragment_without_version_evidence();
+        let full_body = dtls13_server_hello_body();
+        let full = server_hello_fragment(&full_body, 0, full_body.len());
+        dtls.handle_packet(&partial).unwrap();
+        assert!(matches!(dtls.inner, Some(Inner::ClientPending(_))));
+
+        let result = dtls.handle_packet(&full);
+        assert!(
+            matches!(
+                result,
+                Err(Error::SecurityError(ref message))
+                    if message == "Server did not provide key_share extension"
+            ),
+            "synthetic ServerHello should replay into DTLS 1.3 and fail only because the fixture omits key_share: {result:?}"
+        );
+        assert!(matches!(dtls.inner, Some(Inner::Client13(_))));
+        assert_eq!(dtls.protocol_version(), Some(ProtocolVersion::DTLS1_3));
     }
 
     #[test]

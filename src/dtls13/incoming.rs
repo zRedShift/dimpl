@@ -176,6 +176,18 @@ impl Records {
             // This is the ONLY copy: packet -> record buffer
             let record_slice = &packet[..record_end];
             let tail = &packet[record_end..];
+            if defer_after_key_update
+                && parsed_record_count > 0
+                && Dtls13Record::is_ciphertext_header(record_slice[0])
+                && !decrypt.is_peer_encryption_enabled()
+            {
+                validate_record_boundaries(packet, parsed_record_count)?;
+                let mut tail_buffer = Buf::new();
+                tail_buffer.extend_from_slice(packet);
+                deferred_tail = Some(tail_buffer);
+                break;
+            }
+
             match Record::parse(record_slice, decrypt, cs, &pending_expected) {
                 Ok(parsed) => {
                     let mut should_break_after_replay_update = false;
@@ -881,6 +893,37 @@ mod tests {
         out.extend_from_slice(&(fragment.len() as u16).to_be_bytes());
         out.extend_from_slice(fragment);
         out
+    }
+
+    #[test]
+    fn parse_packet_defers_ciphertext_tail_before_peer_encryption() {
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&build_plaintext_record(
+            ContentType::Alert,
+            1,
+            &[0xAA, 0xBB],
+        ));
+        let ciphertext_tail = build_ciphertext_record(2, 2, &[0x11, 0x22, 0x33]);
+        packet.extend_from_slice(&ciphertext_tail);
+
+        let mut handler = TestHandler::default();
+        let parsed =
+            Incoming::parse_packet_defer_after_key_update(&packet, &mut handler, None).unwrap();
+        let incoming = parsed
+            .incoming
+            .expect("plaintext prefix should remain deliverable");
+
+        assert_eq!(handler.classify_calls, 1);
+        assert_eq!(incoming.records().len(), 1);
+        assert_eq!(incoming.first().record().content_type, ContentType::Alert);
+        assert_eq!(
+            parsed
+                .deferred_tail
+                .as_ref()
+                .expect("ciphertext tail should be deferred")
+                .as_ref(),
+            ciphertext_tail.as_slice()
+        );
     }
 
     #[test]
