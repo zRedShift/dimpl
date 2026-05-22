@@ -188,7 +188,20 @@ impl Server {
     }
 
     pub fn handle_packet(&mut self, packet: &[u8]) -> Result<(), Error> {
-        self.engine.parse_packet(packet)?;
+        if self.state == State::AwaitClientHello {
+            self.engine
+                .parse_packet_filtering_records(packet, |record| {
+                    record.record().sequence.epoch == 0
+                        && (record.record().content_type == ContentType::Alert
+                            || (record.record().content_type == ContentType::Handshake
+                                && record.first_handshake().is_some_and(|h| {
+                                    h.header.msg_type == MessageType::ClientHello
+                                })))
+                })?;
+        } else {
+            self.engine.parse_packet(packet)?;
+        }
+
         self.make_progress()?;
         Ok(())
     }
