@@ -2,6 +2,7 @@ use super::super::{SignatureAndHashAlgorithm, SignatureAndHashAlgorithmVec};
 use crate::buffer::Buf;
 use nom::Err;
 use nom::IResult;
+use nom::bytes::complete::take;
 use nom::error::{Error, ErrorKind};
 
 /// SignatureAlgorithms extension as defined in RFC 5246
@@ -22,12 +23,18 @@ impl SignatureAlgorithmsExtension {
 
     pub fn parse(input: &[u8]) -> IResult<&[u8], SignatureAlgorithmsExtension> {
         let (input, list_len) = nom::number::complete::be_u16(input)?;
+        if list_len == 0 || list_len % 2 != 0 {
+            return Err(Err::Failure(Error::new(input, ErrorKind::LengthValue)));
+        }
+
         let mut algorithms = SignatureAndHashAlgorithmVec::new();
-        let mut remaining = list_len as usize;
-        let mut current_input = input;
+        let (input, mut current_input) = take(list_len)(input)?;
+        if !input.is_empty() {
+            return Err(Err::Failure(Error::new(input, ErrorKind::LengthValue)));
+        }
 
         // Parse algorithms, filtering to only keep supported ones
-        while remaining > 0 {
+        while !current_input.is_empty() {
             let (rest, alg) = SignatureAndHashAlgorithm::parse(current_input)?;
             // Only keep supported signature+hash combinations
             if alg.is_supported() {
@@ -36,11 +43,10 @@ impl SignatureAlgorithmsExtension {
                     .map_err(|_| Err::Failure(Error::new(current_input, ErrorKind::LengthValue)))?;
             }
             current_input = rest;
-            remaining -= 2; // Each algorithm pair is 2 bytes
         }
 
         Ok((
-            current_input,
+            input,
             SignatureAlgorithmsExtension {
                 supported_signature_algorithms: algorithms,
             },
@@ -119,6 +125,63 @@ mod tests {
                     if error.code == nom::error::ErrorKind::LengthValue
             ),
             "too many supported signature algorithms should fail with LengthValue"
+        );
+    }
+
+    #[test]
+    fn odd_length_signature_algorithms_are_rejected_without_panic() {
+        let result = std::panic::catch_unwind(|| {
+            SignatureAlgorithmsExtension::parse(&[
+                0x00, 0x01, // Declared list length is not divisible by 2.
+                0x04, 0x03, // Extra byte proves the parser must reject before looping.
+            ])
+        });
+
+        assert!(
+            result.is_ok(),
+            "odd signature_algorithms length must not panic"
+        );
+        assert!(
+            matches!(
+                result.unwrap(),
+                Err(nom::Err::Failure(error))
+                    if error.code == nom::error::ErrorKind::LengthValue
+            ),
+            "odd signature_algorithms length should fail with LengthValue"
+        );
+    }
+
+    #[test]
+    fn empty_signature_algorithms_are_rejected() {
+        let result = SignatureAlgorithmsExtension::parse(&[
+            0x00, 0x00, // Empty signature_algorithms vector is invalid.
+        ]);
+
+        assert!(
+            matches!(
+                result,
+                Err(nom::Err::Failure(error))
+                    if error.code == nom::error::ErrorKind::LengthValue
+            ),
+            "empty signature_algorithms vector should fail with LengthValue"
+        );
+    }
+
+    #[test]
+    fn trailing_signature_algorithms_bytes_are_rejected() {
+        let result = SignatureAlgorithmsExtension::parse(&[
+            0x00, 0x02, // One algorithm follows.
+            0x04, 0x03, // SHA256/ECDSA
+            0xff, // Extension body has a trailing byte beyond the vector.
+        ]);
+
+        assert!(
+            matches!(
+                result,
+                Err(nom::Err::Failure(error))
+                    if error.code == nom::error::ErrorKind::LengthValue
+            ),
+            "trailing signature_algorithms bytes should fail with LengthValue"
         );
     }
 }
