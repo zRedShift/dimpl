@@ -214,6 +214,7 @@ mod dtls12;
 mod dtls13;
 
 use dtls12::{Client as Client12, Server as Server12};
+use dtls13::message::Dtls13Record;
 use dtls13::{Client as Client13, Server as Server13};
 
 use auto::ClientPending;
@@ -436,6 +437,82 @@ fn client_hello_wants_psk(packet: &[u8], config: &Config) -> bool {
     false
 }
 
+fn recordless_incomplete_datagram(packet: &[u8]) -> bool {
+    let Some(&first) = packet.first() else {
+        return false;
+    };
+
+    if Dtls13Record::is_ciphertext_header(first) {
+        return recordless_incomplete_unified_datagram(packet);
+    }
+
+    recordless_incomplete_plaintext_datagram(packet)
+}
+
+fn recordless_incomplete_plaintext_datagram(packet: &[u8]) -> bool {
+    let Some(&content_type) = packet.first() else {
+        return false;
+    };
+    if !matches!(content_type, 20..=23 | 26) {
+        return false;
+    }
+
+    if let Some(&major) = packet.get(1) {
+        if major != 0xFE {
+            return false;
+        }
+    }
+    if packet.len() >= 3 && !matches!(&packet[1..3], [0xFE, 0xFF] | [0xFE, 0xFD]) {
+        return false;
+    }
+    if packet.len() >= 5 {
+        let epoch = u16::from_be_bytes([packet[3], packet[4]]);
+        if epoch == 0 && !matches!(content_type, 20..=22 | 26) {
+            return false;
+        }
+        if content_type == 26 && epoch != 0 {
+            return false;
+        }
+    }
+
+    if packet.len() < Dtls13Record::PLAINTEXT_HEADER_LEN {
+        return true;
+    }
+
+    let length_offset = Dtls13Record::PLAINTEXT_LENGTH_OFFSET;
+    let length =
+        u16::from_be_bytes([packet[length_offset.start], packet[length_offset.end - 1]]) as usize;
+    packet.len() < Dtls13Record::PLAINTEXT_HEADER_LEN + length
+}
+
+fn recordless_incomplete_unified_datagram(packet: &[u8]) -> bool {
+    if packet[0] & 0x10 != 0 {
+        return false;
+    }
+
+    if packet.len() < 2 {
+        return true;
+    }
+
+    let flags = packet[0];
+    let s_flag = flags & 0b0000_1000 != 0;
+    let l_flag = flags & 0b0000_0100 != 0;
+    let seq_len = if s_flag { 2 } else { 1 };
+    let len_len = if l_flag { 2 } else { 0 };
+    let header_len = 1 + seq_len + len_len;
+
+    if packet.len() < header_len {
+        return true;
+    }
+    if !l_flag {
+        return false;
+    }
+
+    let len_offset = 1 + seq_len;
+    let length = u16::from_be_bytes([packet[len_offset], packet[len_offset + 1]]) as usize;
+    packet.len() < header_len + length
+}
+
 impl Dtls {
     /// Create a new DTLS 1.2 instance in the server role.
     ///
@@ -589,6 +666,18 @@ impl Dtls {
         // unwrap is ok. The inner is only Option to work around borrowing
         // issues when doing auto-sensing of DTLS version.
         let inner = self.inner.as_mut().unwrap();
+
+        let drop_recordless = match inner {
+            Inner::Client12(_) | Inner::Server12(_) => {
+                recordless_incomplete_plaintext_datagram(packet)
+            }
+            Inner::Client13(_) | Inner::Server13(_) | Inner::ClientPending(_) => {
+                recordless_incomplete_datagram(packet)
+            }
+        };
+        if drop_recordless {
+            return Ok(());
+        }
 
         // Auto-sense pending states handle the packet themselves
         // (including replay to the newly created inner), so we
@@ -852,6 +941,72 @@ impl fmt::Debug for Output<'_> {
 }
 
 #[cfg(test)]
+mod recordless_incomplete_tests {
+    use super::*;
+
+    fn plaintext_record(content_type: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(content_type);
+        out.extend_from_slice(&[0xFE, 0xFD]);
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&0u64.to_be_bytes()[2..]);
+        out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn unified_record(body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(0x2F);
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    #[test]
+    fn detects_short_initial_plaintext_header() {
+        assert!(recordless_incomplete_datagram(&[0x16]));
+    }
+
+    #[test]
+    fn detects_short_initial_plaintext_body() {
+        let mut packet = plaintext_record(0x16, &[0xAA, 0xBB]);
+        packet.truncate(packet.len() - 1);
+
+        assert!(recordless_incomplete_datagram(&packet));
+    }
+
+    #[test]
+    fn ignores_garbage_and_bad_version() {
+        assert!(!recordless_incomplete_datagram(&[0xFF; 64]));
+        assert!(!recordless_incomplete_datagram(&[0x16, 0x12]));
+    }
+
+    #[test]
+    fn detects_short_initial_unified_header_and_body() {
+        assert!(recordless_incomplete_datagram(&[0x2F]));
+
+        let mut packet = unified_record(&[0xAA, 0xBB]);
+        packet.truncate(packet.len() - 1);
+        assert!(recordless_incomplete_datagram(&packet));
+    }
+
+    #[test]
+    fn complete_first_record_with_trailing_bytes_is_not_recordless() {
+        let mut packet = plaintext_record(0x15, &[0x01, 0x00]);
+        packet.push(0x16);
+
+        assert!(!recordless_incomplete_datagram(&packet));
+    }
+
+    #[test]
+    fn unsupported_cid_header_is_not_recordless() {
+        assert!(!recordless_incomplete_datagram(&[0x3F]));
+    }
+}
+
+#[cfg(test)]
 #[cfg(feature = "rcgen")]
 mod test {
     use std::panic::UnwindSafe;
@@ -1060,6 +1215,97 @@ mod test {
         let mut dtls = new_instance_auto();
         let err = dtls.close().unwrap_err();
         assert!(matches!(err, Error::HandshakePending));
+    }
+
+    #[test]
+    fn fixed_dtls12_drops_recordless_incomplete_datagram() {
+        let mut dtls = new_instance();
+
+        dtls.handle_packet(&[0x16])
+            .expect("recordless incomplete datagram should be a no-op");
+
+        assert_eq!(dtls.protocol_version(), Some(ProtocolVersion::DTLS1_2));
+    }
+
+    #[test]
+    fn fixed_dtls12_rejects_short_unified_header() {
+        let mut dtls = new_instance();
+
+        let err = dtls.handle_packet(&[0x2F]).unwrap_err();
+
+        assert!(matches!(err, Error::ParseIncomplete));
+    }
+
+    #[test]
+    fn fixed_dtls12_handles_empty_datagram() {
+        let mut dtls = new_instance();
+
+        dtls.handle_packet(&[])
+            .expect("empty datagram should remain a no-op");
+    }
+
+    #[test]
+    fn fixed_dtls13_drops_recordless_incomplete_datagram() {
+        let mut dtls = new_instance_13();
+
+        dtls.handle_packet(&[0x16])
+            .expect("recordless incomplete datagram should be a no-op");
+
+        assert_eq!(dtls.protocol_version(), Some(ProtocolVersion::DTLS1_3));
+    }
+
+    #[test]
+    fn auto_client_drops_recordless_incomplete_datagram() {
+        let mut dtls = new_instance_auto();
+        dtls.set_active(true);
+
+        dtls.handle_packet(&[0x16])
+            .expect("recordless incomplete datagram should be a no-op");
+
+        assert!(matches!(dtls.inner, Some(Inner::ClientPending(_))));
+        assert_eq!(dtls.protocol_version(), None);
+    }
+
+    #[test]
+    fn auto_client_rejects_implausible_recordless_incomplete_datagram() {
+        let mut dtls = new_instance_auto();
+        dtls.set_active(true);
+
+        let err = dtls.handle_packet(&[0x16, 0x12]).unwrap_err();
+
+        assert!(matches!(err, Error::UnexpectedMessage(_)));
+        assert!(matches!(dtls.inner, Some(Inner::ClientPending(_))));
+        assert_eq!(dtls.protocol_version(), None);
+    }
+
+    #[test]
+    fn auto_server_drops_recordless_incomplete_datagram() {
+        let mut dtls = new_instance_auto();
+
+        for _ in 0..65 {
+            dtls.handle_packet(&[0x16])
+                .expect("recordless incomplete datagram should be a no-op");
+        }
+
+        assert!(matches!(
+            dtls.inner,
+            Some(Inner::Server13(ref server)) if server.is_auto_mode()
+        ));
+        assert_eq!(dtls.protocol_version(), None);
+    }
+
+    #[test]
+    fn auto_server_rejects_implausible_recordless_incomplete_datagram() {
+        let mut dtls = new_instance_auto();
+
+        let err = dtls.handle_packet(&[0x16, 0x12]).unwrap_err();
+
+        assert!(matches!(err, Error::ParseIncomplete));
+        assert!(matches!(
+            dtls.inner,
+            Some(Inner::Server13(ref server)) if server.is_auto_mode()
+        ));
+        assert_eq!(dtls.protocol_version(), None);
     }
 
     fn make_record(content_type: u8, body: &[u8]) -> Vec<u8> {
