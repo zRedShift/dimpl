@@ -1,5 +1,6 @@
 # Unreleased
 
+  * Reject undersized poll output buffers before writing into them (breaking) #138
   * Represent DTLS wire-code identifiers as compact newtypes (breaking) #137
   * Make public errors structured and fatal-only (breaking) #134
 

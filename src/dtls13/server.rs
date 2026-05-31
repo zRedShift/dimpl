@@ -67,7 +67,7 @@ use crate::dtls13::message::SupportedVersionsClientHello;
 use crate::dtls13::message::SupportedVersionsServerHello;
 use crate::dtls13::message::UseSrtpExtension;
 use crate::dtls13::message::parse_cookie_extension;
-use crate::{Config, DtlsCertificate, Error, InternalError, Output};
+use crate::{Config, DtlsCertificate, Error, InternalError, Output, OutputBuffer};
 
 /// Magic random value indicating HelloRetryRequest (RFC 8446 Section 4.1.3).
 const HRR_RANDOM: [u8; 32] = [
@@ -271,11 +271,20 @@ impl Server {
         Ok(())
     }
 
-    pub fn poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Output<'a> {
+    pub fn poll_output<'a>(&mut self, buf: OutputBuffer<'a>) -> Output<'a> {
         if let Some(event) = self.local_events.pop_front() {
-            return event.into_output(buf, &self.client_certificates);
+            return event.into_output(buf.into_mut(), &self.client_certificates);
         }
         self.engine.poll_output(buf, self.last_now)
+    }
+
+    pub(crate) fn output_buffer_minimum(&self) -> usize {
+        let local_event_minimum = self
+            .local_events
+            .front()
+            .map(|event| event.output_buffer_minimum(&self.client_certificates))
+            .unwrap_or(0);
+        self.engine.output_buffer_minimum().max(local_event_minimum)
     }
 
     /// Handle a timeout event.

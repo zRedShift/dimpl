@@ -28,7 +28,7 @@ use crate::dtls13::message::Sequence;
 use crate::timer::ExponentialBackoff;
 use crate::types::{HashAlgorithm, Random};
 use crate::window::ReplayWindow;
-use crate::{Config, DtlsCertificate, Error, InternalError, Output, SeededRng};
+use crate::{Config, DtlsCertificate, Error, InternalError, Output, OutputBuffer, SeededRng};
 
 const MAX_DEFRAGMENT_PACKETS: usize = 50;
 
@@ -288,6 +288,13 @@ impl Engine {
         &self.config
     }
 
+    pub(crate) fn output_buffer_minimum(&self) -> usize {
+        self.config
+            .mtu()
+            .max(self.queue_tx.front().map(|p| p.len()).unwrap_or(0))
+            .max(self.next_app_data_len().unwrap_or(0))
+    }
+
     pub fn cipher_suite(&self) -> Option<Dtls13CipherSuite> {
         self.cipher_suite
     }
@@ -525,17 +532,20 @@ impl Engine {
         Ok(())
     }
 
-    pub fn poll_output<'a>(&mut self, buf: &'a mut [u8], now: Instant) -> Output<'a> {
+    pub fn poll_output<'a>(&mut self, buf: OutputBuffer<'a>, now: Instant) -> Output<'a> {
         self.purge_handled_queue_rx();
+        let buf = buf.into_mut();
 
-        let buf = match self.poll_app_data(buf) {
-            Ok(p) => return Output::ApplicationData(p),
-            Err(b) => b,
-        };
+        if self.has_app_data() {
+            return Output::ApplicationData(
+                self.poll_app_data(buf)
+                    .expect("has_app_data checked before polling"),
+            );
+        }
 
         self.maybe_schedule_handshake_ack(now);
 
-        if let Ok(p) = self.poll_packet_tx(buf) {
+        if let Some(p) = self.poll_packet_tx(buf) {
             return Output::Packet(p);
         }
 
@@ -549,9 +559,9 @@ impl Engine {
         Output::Timeout(next_timeout)
     }
 
-    fn poll_app_data<'a>(&mut self, buf: &'a mut [u8]) -> Result<&'a [u8], &'a mut [u8]> {
+    fn poll_app_data<'a>(&self, buf: &'a mut [u8]) -> Option<&'a [u8]> {
         if !self.release_app_data {
-            return Err(buf);
+            return None;
         }
 
         let mut unhandled = self
@@ -561,25 +571,43 @@ impl Engine {
             .filter(|r| r.record().content_type == ContentType::ApplicationData)
             .skip_while(|r| r.is_handled());
 
-        let Some(next) = unhandled.next() else {
-            return Err(buf);
-        };
+        let next = unhandled.next()?;
 
         let record_buffer = next.buffer();
         let fragment = next.record().fragment(record_buffer);
         let len = fragment.len();
-
-        assert!(
-            len <= buf.len(),
-            "Output buffer too small for application data {} > {}",
-            len,
-            buf.len()
-        );
-
+        assert!(len <= buf.len(), "validated output buffer too small");
         buf[..len].copy_from_slice(fragment);
         next.set_handled();
 
-        Ok(&buf[..len])
+        Some(&buf[..len])
+    }
+
+    fn has_app_data(&self) -> bool {
+        self.release_app_data
+            && self
+                .queue_rx
+                .iter()
+                .flat_map(|i| i.records().iter())
+                .find(|r| {
+                    r.record().content_type == ContentType::ApplicationData && !r.is_handled()
+                })
+                .is_some()
+    }
+
+    fn next_app_data_len(&self) -> Option<usize> {
+        if !self.release_app_data {
+            return None;
+        }
+
+        let next = self
+            .queue_rx
+            .iter()
+            .flat_map(|i| i.records().iter())
+            .find(|r| r.record().content_type == ContentType::ApplicationData && !r.is_handled())?;
+
+        let record_buffer = next.buffer();
+        Some(next.record().fragment(record_buffer).len())
     }
 
     fn purge_handled_queue_rx(&mut self) {
@@ -597,22 +625,16 @@ impl Engine {
         }
     }
 
-    fn poll_packet_tx<'a>(&mut self, buf: &'a mut [u8]) -> Result<&'a [u8], &'a mut [u8]> {
-        let Some(p) = self.queue_tx.pop_front() else {
-            return Err(buf);
-        };
-
-        assert!(
-            p.len() <= buf.len(),
-            "Output buffer too small for packet {} > {}",
-            p.len(),
-            buf.len()
-        );
+    fn poll_packet_tx<'a>(&mut self, buf: &'a mut [u8]) -> Option<&'a [u8]> {
+        let p = self.queue_tx.front()?;
 
         let len = p.len();
-        buf[..len].copy_from_slice(&p);
+        assert!(len <= buf.len(), "validated output buffer too small");
 
-        Ok(&buf[..len])
+        buf[..len].copy_from_slice(p);
+        self.queue_tx.pop_front();
+
+        Some(&buf[..len])
     }
 
     /// Prevent subsequent records from being appended to the current last

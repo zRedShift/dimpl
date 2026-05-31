@@ -522,8 +522,7 @@ fn auto_client_to_dtls13_server_no_cookie() {
     );
 }
 
-/// Auto-sense client defers the hybrid ClientHello when the poll buffer
-/// is too small, and emits it on the next poll with a large enough buffer.
+/// Auto-sense client rejects undersized output buffers before polling.
 #[test]
 #[cfg(feature = "rcgen")]
 fn auto_client_poll_output_undersized_buffer() {
@@ -541,23 +540,56 @@ fn auto_client_poll_output_undersized_buffer() {
     // Trigger the hybrid ClientHello
     client.handle_timeout(now).expect("handle_timeout");
 
-    // Poll with a buffer that is too small for the wire packet.
+    // Validate a buffer that is too small for any configured output.
     // Before the fix this would panic with an index-out-of-bounds.
     let mut tiny_buf = [0u8; 4];
-    let output = client.poll_output(&mut tiny_buf);
+    let tiny_len = tiny_buf.len();
+    let err = client
+        .output_buffer(&mut tiny_buf)
+        .expect_err("undersized buffer should be rejected before polling");
+    assert_eq!(err.actual(), tiny_len);
+    assert!(err.minimum() > tiny_len);
 
-    // Should return Timeout (packet deferred), not a Packet.
-    assert!(
-        matches!(output, Output::Timeout(_)),
-        "undersized buffer should yield Timeout, got: {output:?}"
-    );
-
-    // Now poll with a large buffer — the deferred packet should come through.
+    // Now poll with a valid buffer and the packet should come through.
     let mut big_buf = vec![0u8; 2048];
-    let output = client.poll_output(&mut big_buf);
+    let output = poll_output(&mut client, &mut big_buf);
     assert!(
         matches!(output, Output::Packet(_)),
         "large buffer should yield Packet, got: {output:?}"
+    );
+}
+
+/// Auto-sense client output-buffer minimum includes the full hybrid packet,
+/// not just the configured MTU.
+#[test]
+#[cfg(feature = "rcgen")]
+fn auto_client_poll_output_accounts_for_oversized_hybrid_packet() {
+    use dimpl::certificate::generate_self_signed_certificate;
+
+    let _ = env_logger::try_init();
+
+    let cert = generate_self_signed_certificate().expect("gen cert");
+    let mtu = 64;
+    let config = small_mtu_config(mtu);
+
+    let now = Instant::now();
+    let mut client = Dtls::new_auto(config, cert, now);
+    client.set_active(true);
+
+    client.handle_timeout(now).expect("handle_timeout");
+
+    let mut mtu_buf = vec![0u8; mtu];
+    let err = client
+        .output_buffer(&mut mtu_buf)
+        .expect_err("hybrid ClientHello should exceed exact MTU buffer");
+    assert_eq!(err.actual(), mtu);
+    assert!(err.minimum() > mtu);
+
+    let mut packet_buf = vec![0u8; err.minimum()];
+    let output = poll_output(&mut client, &mut packet_buf);
+    assert!(
+        matches!(output, Output::Packet(_)),
+        "valid hybrid packet buffer should yield Packet, got: {output:?}"
     );
 }
 

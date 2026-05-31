@@ -70,7 +70,10 @@ fn dtls13_malformed_datagram_is_discarded_without_processing_alerts() {
         .expect("malformed datagram should be discarded");
 
     let mut buf = [0; 1500];
-    assert!(!matches!(server.poll_output(&mut buf), Output::CloseNotify));
+    assert!(!matches!(
+        poll_output(&mut server, &mut buf),
+        Output::CloseNotify
+    ));
 }
 
 #[test]
@@ -429,7 +432,7 @@ fn queue_ack_with_peer_key_update(sender: &mut Dtls, receiver: &mut Dtls, now: &
 fn drain_expected_app_data(endpoint: &mut Dtls, expected: usize) {
     let mut buf = vec![0u8; 2048];
     for i in 0..expected {
-        match endpoint.poll_output(&mut buf) {
+        match poll_output(endpoint, &mut buf) {
             Output::ApplicationData(data) => {
                 assert_eq!(
                     data,
@@ -476,7 +479,7 @@ fn dtls13_client_close_after_queued_ack_sends_close_notify() {
     now += Duration::from_millis(10);
     client.handle_timeout(now).expect("client timeout");
     let mut buf = vec![0u8; 2048];
-    let first_packet = match client.poll_output(&mut buf) {
+    let first_packet = match poll_output(&mut client, &mut buf) {
         Output::Packet(packet) => packet.to_vec(),
         _ => panic!("expected first close output packet"),
     };
@@ -527,7 +530,7 @@ fn dtls13_server_close_after_queued_ack_sends_close_notify() {
     now += Duration::from_millis(10);
     server.handle_timeout(now).expect("server timeout");
     let mut buf = vec![0u8; 2048];
-    let first_packet = match server.poll_output(&mut buf) {
+    let first_packet = match poll_output(&mut server, &mut buf) {
         Output::Packet(packet) => packet.to_vec(),
         _ => panic!("expected first close output packet"),
     };
@@ -1600,7 +1603,7 @@ fn dtls13_app_data_delivered_before_close_notify() {
     let mut close_after_data = false;
     let mut buf = vec![0u8; 2048];
     loop {
-        match server.poll_output(&mut buf) {
+        match poll_output(&mut server, &mut buf) {
             Output::ApplicationData(data) => {
                 assert!(
                     !saw_close_notify,

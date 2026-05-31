@@ -85,7 +85,7 @@ fn run_client_server_with_mtu(mtu: usize) -> (usize, usize) {
 
         let mut continue_polling = true;
         while continue_polling {
-            let output = client.poll_output(&mut out_buf);
+            let output = poll_output(&mut client, &mut out_buf);
             match output {
                 Output::Packet(data) => {
                     client_to_server_packets += 1;

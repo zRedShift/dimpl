@@ -29,7 +29,7 @@ use crate::dtls12::message::{CompressionMethod, ContentType, Cookie};
 use crate::dtls12::message::{DigitallySigned, Dtls12CipherSuite};
 use crate::dtls12::message::{ExtensionType, KeyExchangeAlgorithm, MessageType, ProtocolVersion};
 use crate::dtls12::message::{Random, SessionId, SignatureAndHashAlgorithm, UseSrtpExtension};
-use crate::{Config, DtlsCertificate, Error, InternalError, KeyingMaterial, Output};
+use crate::{Config, DtlsCertificate, Error, InternalError, KeyingMaterial, Output, OutputBuffer};
 
 /// DTLS client
 pub struct Client {
@@ -197,11 +197,20 @@ impl Client {
         }
     }
 
-    pub fn poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Output<'a> {
+    pub fn poll_output<'a>(&mut self, buf: OutputBuffer<'a>) -> Output<'a> {
         if let Some(event) = self.local_events.pop_front() {
-            return event.into_output(buf, &self.server_certificates);
+            return event.into_output(buf.into_mut(), &self.server_certificates);
         }
         self.engine.poll_output(buf, self.last_now)
+    }
+
+    pub(crate) fn output_buffer_minimum(&self) -> usize {
+        let local_event_minimum = self
+            .local_events
+            .front()
+            .map(|event| event.output_buffer_minimum(&self.server_certificates))
+            .unwrap_or(0);
+        self.engine.output_buffer_minimum().max(local_event_minimum)
     }
 
     /// Explicitly start the handshake process by sending a ClientHello
@@ -1376,16 +1385,21 @@ fn handshake_create_certificate_verify(body: &mut Buf, engine: &mut Engine) -> R
 }
 
 impl LocalEvent {
+    pub fn output_buffer_minimum(&self, peer_certs: &[Buf]) -> usize {
+        match self {
+            LocalEvent::PeerCert => peer_certs.first().map(|cert| cert.len()).unwrap_or(0),
+            LocalEvent::Connected | LocalEvent::KeyingMaterial(_, _) => 0,
+        }
+    }
+
     pub fn into_output<'a>(self, buf: &'a mut [u8], peer_certs: &[Buf]) -> Output<'a> {
         match self {
             LocalEvent::PeerCert => {
-                let l = peer_certs[0].len();
-                assert!(
-                    l <= buf.len(),
-                    "Output buffer too small for peer certificate"
-                );
-                buf[..l].copy_from_slice(&peer_certs[0]);
-                Output::PeerCert(&buf[..l])
+                let cert = &peer_certs[0];
+                let len = cert.len();
+                assert!(len <= buf.len(), "validated output buffer too small");
+                buf[..len].copy_from_slice(cert);
+                Output::PeerCert(&buf[..len])
             }
             LocalEvent::Connected => Output::Connected,
             LocalEvent::KeyingMaterial(m, profile) => {
@@ -1465,5 +1479,20 @@ mod tests {
         let err = State::derive_keys(&mut client).expect_err("derive_keys requires server random");
 
         assert!(matches!(err, Error::InvalidState(_)));
+    }
+
+    #[test]
+    fn peer_cert_output_copies_into_output_buffer() {
+        let mut cert = Buf::new();
+        cert.extend_from_slice(&[1, 2, 3, 4]);
+        let certs = [cert];
+        let mut buf = [0u8; 4];
+
+        let result = LocalEvent::PeerCert.into_output(&mut buf, &certs);
+
+        match result {
+            Output::PeerCert(bytes) => assert_eq!(bytes, &[1, 2, 3, 4]),
+            other => panic!("expected PeerCert output, got: {other:?}"),
+        }
     }
 }

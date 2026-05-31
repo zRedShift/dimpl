@@ -24,8 +24,11 @@ pub fn collect_packets(endpoint: &mut Dtls) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     let mut buf = vec![0u8; 2048];
     loop {
-        match endpoint.poll_output(&mut buf) {
-            Output::Packet(p) => out.push(p.to_vec()),
+        match poll_output(endpoint, &mut buf) {
+            Output::Packet(p) => {
+                out.push(p.to_vec());
+                buf.resize(2048, 0);
+            }
             Output::Timeout(_) => break,
             _ => {}
         }
@@ -33,20 +36,41 @@ pub fn collect_packets(endpoint: &mut Dtls) -> Vec<Vec<u8>> {
     out
 }
 
+pub fn poll_output<'a>(endpoint: &'a mut Dtls, buf: &'a mut [u8]) -> Output<'a> {
+    let buf = endpoint.output_buffer(buf).expect("output buffer >= MTU");
+    endpoint.poll_output(buf).expect("validated output buffer")
+}
+
 /// Poll until `Timeout`, collecting everything.
 pub fn drain_outputs(endpoint: &mut Dtls) -> DrainedOutputs {
     let mut result = DrainedOutputs::default();
     let mut buf = vec![0u8; 2048];
     loop {
-        match endpoint.poll_output(&mut buf) {
-            Output::Packet(p) => result.packets.push(p.to_vec()),
-            Output::Connected => result.connected = true,
-            Output::PeerCert(cert) => result.peer_cert = Some(cert.to_vec()),
+        match poll_output(endpoint, &mut buf) {
+            Output::Packet(p) => {
+                result.packets.push(p.to_vec());
+                buf.resize(2048, 0);
+            }
+            Output::Connected => {
+                result.connected = true;
+                buf.resize(2048, 0);
+            }
+            Output::PeerCert(cert) => {
+                result.peer_cert = Some(cert.to_vec());
+                buf.resize(2048, 0);
+            }
             Output::KeyingMaterial(km, profile) => {
                 result.keying_material = Some((km.to_vec(), profile));
+                buf.resize(2048, 0);
             }
-            Output::ApplicationData(data) => result.app_data.push(data.to_vec()),
-            Output::CloseNotify => result.close_notify = true,
+            Output::ApplicationData(data) => {
+                result.app_data.push(data.to_vec());
+                buf.resize(2048, 0);
+            }
+            Output::CloseNotify => {
+                result.close_notify = true;
+                buf.resize(2048, 0);
+            }
             Output::Timeout(t) => {
                 result.timeout = Some(t);
                 break;

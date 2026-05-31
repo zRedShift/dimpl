@@ -55,16 +55,17 @@
 //! your policy (fingerprint, chain building, name/EKU checks, pinning, etc.).
 //!
 //! ## Sans‑IO integration model
-//! Drive the engine with three calls:
+//! Drive the engine with these calls:
 //! - [`Dtls::handle_packet`][handle_packet] — feed an entire
 //!   received UDP datagram.
+//! - [`Dtls::output_buffer`][output_buffer] — validate a caller-owned
+//!   poll buffer for this connection.
 //! - [`Dtls::poll_output`][poll_output] — drain pending output:
 //!   DTLS records, timers, events.
 //! - [`Dtls::handle_timeout`][handle_timeout] — trigger
 //!   retransmissions/time‑based progress.
 //!
-//! The output is an [`Output`][output] enum with borrowed
-//! references into your provided buffer:
+//! The output is an [`Output`][output] enum with borrowed output data:
 //! - `Packet(&[u8])`: send on your UDP socket
 //! - `Timeout(Instant)`: schedule a timer and call `handle_timeout` at/after it
 //! - `Connected`: handshake complete
@@ -111,26 +112,37 @@
 //!         // Drain engine output until we have to wait for I/O or a timer
 //!         let mut out_buf = vec![0u8; 2048];
 //!         loop {
-//!             match dtls.poll_output(&mut out_buf) {
-//!                 Output::Packet(p) => send_udp(p),
-//!                 Output::Timeout(t) => { next_wake = Some(t); break; }
-//!                 Output::Connected => {
-//!                     // DTLS established — application may start sending
+//!             let output_buf = loop {
+//!                 match dtls.output_buffer(&mut out_buf) {
+//!                     Ok(output_buf) => break output_buf,
+//!                     Err(err) => out_buf.resize(err.minimum(), 0),
 //!                 }
-//!                 Output::PeerCert(_der) => {
+//!             };
+//!
+//!             match dtls.poll_output(output_buf) {
+//!                 Err(err) => {
+//!                     out_buf.resize(err.minimum(), 0);
+//!                     continue;
+//!                 }
+//!                 Ok(Output::Packet(p)) => send_udp(p),
+//!                 Ok(Output::Timeout(t)) => { next_wake = Some(t); break; }
+//!                 Ok(Output::Connected) => {
+//!                     // DTLS established - application may start sending
+//!                 }
+//!                 Ok(Output::PeerCert(_der)) => {
 //!                     // Inspect peer leaf certificate if desired
 //!                 }
-//!                 Output::KeyingMaterial(_km, _profile) => {
+//!                 Ok(Output::KeyingMaterial(_km, _profile)) => {
 //!                     // Provide to SRTP stack
 //!                 }
-//!                 Output::ApplicationData(_data) => {
+//!                 Ok(Output::ApplicationData(_data)) => {
 //!                     // Deliver plaintext to application
 //!                 }
-//!                 Output::CloseNotify => {
-//!                     // Peer initiated graceful shutdown — leave the event loop
+//!                 Ok(Output::CloseNotify) => {
+//!                     // Peer initiated graceful shutdown - leave the event loop
 //!                     return Ok(());
 //!                 }
-//!                 _ => {}
+//!                 Ok(_) => {}
 //!             }
 //!         }
 //!
@@ -200,6 +212,7 @@
 //! [new_auto]: https://docs.rs/dimpl/latest/dimpl/struct.Dtls.html#method.new_auto
 //! [peer_cert]: https://docs.rs/dimpl/latest/dimpl/enum.Output.html#variant.PeerCert
 //! [handle_packet]: https://docs.rs/dimpl/latest/dimpl/struct.Dtls.html#method.handle_packet
+//! [output_buffer]: https://docs.rs/dimpl/latest/dimpl/struct.Dtls.html#method.output_buffer
 //! [poll_output]: https://docs.rs/dimpl/latest/dimpl/struct.Dtls.html#method.poll_output
 //! [handle_timeout]: https://docs.rs/dimpl/latest/dimpl/struct.Dtls.html#method.handle_timeout
 //! [output]: https://docs.rs/dimpl/latest/dimpl/enum.Output.html
@@ -730,14 +743,44 @@ impl Dtls {
         Ok(())
     }
 
+    /// Validate a caller-owned buffer for [`Dtls::poll_output`].
+    ///
+    /// The buffer must be at least this connection's current output-buffer
+    /// minimum: normally the configured MTU, or larger when output already
+    /// queued by the engine exceeds that size.
+    pub fn output_buffer<'a>(
+        &self,
+        buf: &'a mut [u8],
+    ) -> Result<OutputBuffer<'a>, OutputBufferTooSmall> {
+        OutputBuffer::new(buf, self.output_buffer_minimum())
+    }
+
     /// Poll for pending output from the DTLS engine.
-    pub fn poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Output<'a> {
-        match self.inner.as_mut().unwrap() {
+    pub fn poll_output<'a>(
+        &mut self,
+        buf: OutputBuffer<'a>,
+    ) -> Result<Output<'a>, OutputBufferTooSmall> {
+        let minimum = self.output_buffer_minimum();
+        if buf.len() < minimum {
+            return Err(OutputBufferTooSmall::new(buf.len(), minimum));
+        }
+
+        Ok(match self.inner.as_mut().unwrap() {
             Inner::Client12(client) => client.poll_output(buf),
             Inner::Server12(server) => server.poll_output(buf),
             Inner::Client13(client) => client.poll_output(buf),
             Inner::Server13(server) => server.poll_output(buf),
             Inner::ClientPending(cp) => cp.poll_output(buf),
+        })
+    }
+
+    fn output_buffer_minimum(&self) -> usize {
+        match self.inner.as_ref().unwrap() {
+            Inner::Client12(client) => client.output_buffer_minimum(),
+            Inner::Server12(server) => server.output_buffer_minimum(),
+            Inner::Client13(client) => client.output_buffer_minimum(),
+            Inner::Server13(server) => server.output_buffer_minimum(),
+            Inner::ClientPending(cp) => cp.output_buffer_minimum(),
         }
     }
 
@@ -834,6 +877,83 @@ impl fmt::Debug for Dtls {
     }
 }
 
+/// A caller-owned poll output buffer validated against a current output size.
+///
+/// Construct this with [`Dtls::output_buffer`] immediately before calling
+/// [`Dtls::poll_output`]. The consuming endpoint revalidates the current
+/// minimum before producing output.
+pub struct OutputBuffer<'a> {
+    buf: &'a mut [u8],
+}
+
+impl<'a> OutputBuffer<'a> {
+    fn new(buf: &'a mut [u8], minimum: usize) -> Result<Self, OutputBufferTooSmall> {
+        if buf.len() < minimum {
+            return Err(OutputBufferTooSmall::new(buf.len(), minimum));
+        }
+
+        Ok(Self { buf })
+    }
+
+    pub(crate) fn into_mut(self) -> &'a mut [u8] {
+        self.buf
+    }
+
+    /// Length of the validated buffer.
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Whether the validated buffer is empty.
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+}
+
+impl fmt::Debug for OutputBuffer<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OutputBuffer")
+            .field("len", &self.buf.len())
+            .finish()
+    }
+}
+
+/// Error returned when a slice is smaller than the connection's current
+/// output-buffer minimum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputBufferTooSmall {
+    actual: usize,
+    minimum: usize,
+}
+
+impl OutputBufferTooSmall {
+    fn new(actual: usize, minimum: usize) -> Self {
+        Self { actual, minimum }
+    }
+
+    /// The provided buffer length.
+    pub fn actual(&self) -> usize {
+        self.actual
+    }
+
+    /// The minimum required buffer length.
+    pub fn minimum(&self) -> usize {
+        self.minimum
+    }
+}
+
+impl fmt::Display for OutputBufferTooSmall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "output buffer too small: {} < {}",
+            self.actual, self.minimum
+        )
+    }
+}
+
+impl std::error::Error for OutputBufferTooSmall {}
+
 /// Output events produced by the DTLS engine when polled.
 #[non_exhaustive]
 pub enum Output<'a> {
@@ -921,6 +1041,12 @@ mod test {
         Dtls::new_auto(config, cert, Instant::now())
     }
 
+    fn new_instance_auto_with_mtu(mtu: usize) -> Dtls {
+        let cert = generate_self_signed_certificate().expect("Failed to generate cert");
+        let config = Arc::new(Config::builder().mtu(mtu).build().expect("config"));
+        Dtls::new_auto(config, cert, Instant::now())
+    }
+
     #[test]
     fn test_dtls_default() {
         let mut dtls = new_instance();
@@ -954,13 +1080,35 @@ mod test {
         dtls.set_active(true);
         let now = Instant::now();
         dtls.handle_timeout(now).unwrap();
-        let output = &mut [0u8; 2048];
+        let mut output = [0u8; 2048];
         // First poll returns the hybrid ClientHello packet
-        let result = dtls.poll_output(output);
+        let result = {
+            let output = dtls.output_buffer(&mut output).unwrap();
+            dtls.poll_output(output).unwrap()
+        };
         assert!(matches!(result, Output::Packet(_)));
         // Second poll returns Timeout
-        let result = dtls.poll_output(output);
+        let result = {
+            let output = dtls.output_buffer(&mut output).unwrap();
+            dtls.poll_output(output).unwrap()
+        };
         assert!(matches!(result, Output::Timeout(_)));
+    }
+
+    #[test]
+    fn output_buffer_from_lower_mtu_endpoint_is_revalidated() {
+        let low_mtu = new_instance_auto_with_mtu(64);
+
+        let mut high_mtu = new_instance_auto();
+        high_mtu.set_active(true);
+        high_mtu.handle_timeout(Instant::now()).unwrap();
+
+        let mut output = [0u8; 64];
+        let output = low_mtu.output_buffer(&mut output).unwrap();
+        let err = high_mtu.poll_output(output).unwrap_err();
+
+        assert_eq!(err.actual(), 64);
+        assert!(err.minimum() > 64);
     }
 
     #[test]
@@ -976,7 +1124,11 @@ mod test {
         // Drain the hybrid ClientHello
         let mut buf = [0u8; 2048];
         loop {
-            if matches!(dtls.poll_output(&mut buf), Output::Timeout(_)) {
+            let output = {
+                let buf = dtls.output_buffer(&mut buf).unwrap();
+                dtls.poll_output(buf).unwrap()
+            };
+            if matches!(output, Output::Timeout(_)) {
                 break;
             }
         }
@@ -988,7 +1140,8 @@ mod test {
 
         // These must NOT panic — inner should still be intact
         dtls.handle_timeout(now).unwrap();
-        let _ = dtls.poll_output(&mut buf);
+        let buf = dtls.output_buffer(&mut buf).unwrap();
+        let _ = dtls.poll_output(buf).unwrap();
     }
 
     #[test]

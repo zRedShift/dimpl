@@ -36,7 +36,7 @@ use crate::dtls12::message::{ServerHello, SessionId, SignatureAlgorithm};
 use crate::dtls12::message::{SignatureAlgorithmsExtension, SignatureAndHashAlgorithm};
 use crate::dtls12::message::{SignatureAndHashAlgorithmVec, SrtpProfileId};
 use crate::dtls12::message::{SrtpProfileVec, SupportedGroupsExtension, UseSrtpExtension};
-use crate::{Config, Error, InternalError, Output};
+use crate::{Config, Error, InternalError, Output, OutputBuffer};
 
 /// Length of the random dummy PSK used when identity resolution fails.
 /// Fixed so handshake timing does not leak the failure, and long enough
@@ -199,11 +199,20 @@ impl Server {
         }
     }
 
-    pub fn poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Output<'a> {
+    pub fn poll_output<'a>(&mut self, buf: OutputBuffer<'a>) -> Output<'a> {
         if let Some(event) = self.local_events.pop_front() {
-            return event.into_output(buf, &self.client_certificates);
+            return event.into_output(buf.into_mut(), &self.client_certificates);
         }
         self.engine.poll_output(buf, self.last_now)
+    }
+
+    pub(crate) fn output_buffer_minimum(&self) -> usize {
+        let local_event_minimum = self
+            .local_events
+            .front()
+            .map(|event| event.output_buffer_minimum(&self.client_certificates))
+            .unwrap_or(0);
+        self.engine.output_buffer_minimum().max(local_event_minimum)
     }
 
     pub fn handle_timeout(&mut self, now: Instant) -> Result<(), Error> {

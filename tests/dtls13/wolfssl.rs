@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use dimpl::{Config, Dtls, Output, SrtpProfile};
 
+use crate::common::poll_output;
 use crate::wolfssl_helper::{DtlsEvent, WolfDtlsCert};
 
 // =============================================================================
@@ -34,7 +35,7 @@ fn drain_dimpl_outputs(endpoint: &mut Dtls) -> DrainedOutputs {
     let mut buf = vec![0u8; 2048];
 
     loop {
-        match endpoint.poll_output(&mut buf) {
+        match poll_output(endpoint, &mut buf) {
             Output::Packet(p) => result.packets.push(p.to_vec()),
             Output::Connected => result.connected = true,
             Output::PeerCert(cert) => result.peer_cert = Some(cert.to_vec()),

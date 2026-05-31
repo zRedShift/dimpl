@@ -98,7 +98,15 @@ be followed by polling until `Output::Timeout`:
 ```rust
 client.handle_timeout(now);
 loop {
-    match client.poll_output(&mut buf) {
+    let output_buf = match client.output_buffer(&mut buf) {
+        Ok(output_buf) => output_buf,
+        Err(err) => {
+            buf.resize(err.minimum(), 0);
+            continue;
+        }
+    };
+
+    match client.poll_output(output_buf)? {
         Output::Packet(data) => { /* send to peer */ }
         Output::Connected => { /* handshake complete */ }
         Output::Timeout(when) => break,

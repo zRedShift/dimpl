@@ -82,7 +82,10 @@ fn dtls12_malformed_datagram_is_discarded_without_processing_alerts() {
         .expect("malformed datagram should be discarded");
 
     let mut buf = [0; 1500];
-    assert!(!matches!(server.poll_output(&mut buf), Output::CloseNotify));
+    assert!(!matches!(
+        poll_output(&mut server, &mut buf),
+        Output::CloseNotify
+    ));
 }
 
 #[test]
@@ -1060,7 +1063,7 @@ fn dtls12_app_data_delivered_before_close_notify() {
     let mut close_after_data = false;
     let mut buf = vec![0u8; 2048];
     loop {
-        match server.poll_output(&mut buf) {
+        match poll_output(&mut server, &mut buf) {
             Output::ApplicationData(data) => {
                 assert!(
                     !saw_close_notify,

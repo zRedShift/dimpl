@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use dimpl::{Config, Dtls, Output};
 
+use crate::common::poll_output;
 use crate::ossl_helper::{DtlsCertOptions, DtlsEvent, OsslDtlsCert};
 
 #[test]
@@ -80,7 +81,7 @@ fn dtls12_ossl_client_handshake() {
         let mut continue_polling = true;
         while continue_polling {
             // poll_output returns an Output enum (not Option wrapped)
-            let output = client.poll_output(&mut out_buf);
+            let output = poll_output(&mut client, &mut out_buf);
             match output {
                 Output::Packet(data) => {
                     // Client data goes to server
@@ -293,7 +294,7 @@ fn dtls12_ossl_server_handshake() {
 
         // 2) Poll server outputs and feed to client
         loop {
-            match server.poll_output(&mut out_buf) {
+            match poll_output(&mut server, &mut out_buf) {
                 Output::Packet(data) => {
                     client
                         .handle_receive(data, &mut client_events)
@@ -451,7 +452,7 @@ fn dtls12_ossl_client_retransmit_on_timeout() {
     // Poll client: collect the first flight but DROP it (don't deliver to server)
     let mut first_flight_dropped = false;
     loop {
-        match client.poll_output(&mut out_buf) {
+        match poll_output(&mut client, &mut out_buf) {
             Output::Packet(_data) => {
                 // Intentionally drop the packet -- do not deliver to server
                 first_flight_dropped = true;
@@ -476,7 +477,7 @@ fn dtls12_ossl_client_retransmit_on_timeout() {
     // Poll to get the timeout value (no packets expected here)
     let flight_timeout;
     loop {
-        if let Output::Timeout(t) = client.poll_output(&mut out_buf) {
+        if let Output::Timeout(t) = poll_output(&mut client, &mut out_buf) {
             flight_timeout = t;
             break;
         }
@@ -489,7 +490,7 @@ fn dtls12_ossl_client_retransmit_on_timeout() {
     // Poll client again: this time deliver the retransmitted flight to the server
     let mut retransmitted = false;
     loop {
-        match client.poll_output(&mut out_buf) {
+        match poll_output(&mut client, &mut out_buf) {
             Output::Packet(data) => {
                 retransmitted = true;
                 if let Err(e) = server.handle_receive(data, &mut server_events) {
@@ -532,7 +533,7 @@ fn dtls12_ossl_client_retransmit_on_timeout() {
 
         // Poll client for output
         loop {
-            match client.poll_output(&mut out_buf) {
+            match poll_output(&mut client, &mut out_buf) {
                 Output::Packet(data) => {
                     if let Err(e) = server.handle_receive(data, &mut server_events) {
                         panic!("Server failed to handle client packet: {:?}", e);
@@ -616,7 +617,7 @@ fn dtls12_ossl_client_handles_duplicates() {
 
         // Poll client for output
         loop {
-            match client.poll_output(&mut out_buf) {
+            match poll_output(&mut client, &mut out_buf) {
                 Output::Packet(data) => {
                     if let Err(e) = server.handle_receive(data, &mut server_events) {
                         panic!("Server failed to handle client packet: {:?}", e);
@@ -788,7 +789,7 @@ fn dtls12_ossl_server_bidirectional_data() {
 
         // 2) Poll server outputs and feed to client
         loop {
-            match server.poll_output(&mut out_buf) {
+            match poll_output(&mut server, &mut out_buf) {
                 Output::Packet(data) => {
                     client
                         .handle_receive(data, &mut client_events)

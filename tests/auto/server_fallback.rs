@@ -500,7 +500,7 @@ fn auto_server_set_active_creates_client_pending() {
     // Should be able to produce a hybrid ClientHello
     dtls.handle_timeout(Instant::now()).unwrap();
     let mut buf = vec![0u8; 2048];
-    let output = dtls.poll_output(&mut buf);
+    let output = poll_output(&mut dtls, &mut buf);
     assert!(
         matches!(output, Output::Packet(_)),
         "Should send hybrid ClientHello"

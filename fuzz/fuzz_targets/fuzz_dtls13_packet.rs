@@ -42,10 +42,22 @@ fuzz_target!(|data: &[u8]| {
 
         // Drain any initial packets (ClientHello) with a limit to prevent infinite loops
         for _ in 0..10 {
-            match dtls.poll_output(&mut buf) {
-                Output::Timeout(_) => break,
-                Output::Packet(_) => continue,
-                _ => break,
+            let output_buf = match dtls.output_buffer(&mut buf) {
+                Ok(output_buf) => output_buf,
+                Err(err) => {
+                    buf.resize(err.minimum(), 0);
+                    continue;
+                }
+            };
+
+            match dtls.poll_output(output_buf) {
+                Ok(Output::Timeout(_)) => break,
+                Ok(Output::Packet(_)) => continue,
+                Ok(_) => break,
+                Err(err) => {
+                    buf.resize(err.minimum(), 0);
+                    continue;
+                }
             }
         }
 

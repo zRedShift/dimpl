@@ -15,6 +15,7 @@ pub struct DrainedOutputs {
     pub peer_cert: Option<Vec<u8>>,
     pub keying_material: Option<(Vec<u8>, SrtpProfile)>,
     pub app_data: Vec<Vec<u8>>,
+    pub output_buffer_too_small: Vec<(usize, usize)>,
     pub timeout: Option<Instant>,
     pub close_notify: bool,
 }
@@ -24,7 +25,7 @@ pub fn collect_packets(endpoint: &mut Dtls) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     let mut buf = vec![0u8; 2048];
     loop {
-        match endpoint.poll_output(&mut buf) {
+        match poll_output(endpoint, &mut buf) {
             Output::Packet(p) => out.push(p.to_vec()),
             Output::Timeout(_) => break,
             _ => {}
@@ -33,20 +34,64 @@ pub fn collect_packets(endpoint: &mut Dtls) -> Vec<Vec<u8>> {
     out
 }
 
+pub fn poll_output<'a>(endpoint: &'a mut Dtls, buf: &'a mut [u8]) -> Output<'a> {
+    let buf = endpoint.output_buffer(buf).expect("output buffer >= MTU");
+    endpoint.poll_output(buf).expect("validated output buffer")
+}
+
 /// Poll until `Timeout`, collecting everything.
 pub fn drain_outputs(endpoint: &mut Dtls) -> DrainedOutputs {
+    drain_outputs_with_initial_buffer(endpoint, 2048)
+}
+
+/// Poll until `Timeout`, collecting everything and growing the output buffer
+/// until it satisfies the typed output-buffer precondition.
+pub fn drain_outputs_with_initial_buffer(
+    endpoint: &mut Dtls,
+    initial_len: usize,
+) -> DrainedOutputs {
     let mut result = DrainedOutputs::default();
-    let mut buf = vec![0u8; 2048];
+    let mut buf = vec![0u8; initial_len];
     loop {
-        match endpoint.poll_output(&mut buf) {
-            Output::Packet(p) => result.packets.push(p.to_vec()),
-            Output::Connected => result.connected = true,
-            Output::PeerCert(cert) => result.peer_cert = Some(cert.to_vec()),
+        let output_buf = match endpoint.output_buffer(&mut buf) {
+            Ok(buf) => buf,
+            Err(err) => {
+                result
+                    .output_buffer_too_small
+                    .push((err.actual(), err.minimum()));
+                buf.resize(err.minimum(), 0);
+                continue;
+            }
+        };
+
+        match endpoint
+            .poll_output(output_buf)
+            .expect("validated output buffer")
+        {
+            Output::Packet(p) => {
+                result.packets.push(p.to_vec());
+                buf.resize(initial_len, 0);
+            }
+            Output::Connected => {
+                result.connected = true;
+                buf.resize(initial_len, 0);
+            }
+            Output::PeerCert(cert) => {
+                result.peer_cert = Some(cert.to_vec());
+                buf.resize(initial_len, 0);
+            }
             Output::KeyingMaterial(km, profile) => {
                 result.keying_material = Some((km.to_vec(), profile));
+                buf.resize(initial_len, 0);
             }
-            Output::ApplicationData(data) => result.app_data.push(data.to_vec()),
-            Output::CloseNotify => result.close_notify = true,
+            Output::ApplicationData(data) => {
+                result.app_data.push(data.to_vec());
+                buf.resize(initial_len, 0);
+            }
+            Output::CloseNotify => {
+                result.close_notify = true;
+                buf.resize(initial_len, 0);
+            }
             Output::Timeout(t) => {
                 result.timeout = Some(t);
                 break;

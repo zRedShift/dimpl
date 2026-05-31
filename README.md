@@ -57,16 +57,17 @@ application is responsible for validating the peer certificate according to
 your policy (fingerprint, chain building, name/EKU checks, pinning, etc.).
 
 ### Sans‑IO integration model
-Drive the engine with three calls:
+Drive the engine with these calls:
 - [`Dtls::handle_packet`][handle_packet] — feed an entire
   received UDP datagram.
+- [`Dtls::output_buffer`][output_buffer] — validate a caller-owned
+  poll buffer for this connection.
 - [`Dtls::poll_output`][poll_output] — drain pending output:
   DTLS records, timers, events.
 - [`Dtls::handle_timeout`][handle_timeout] — trigger
   retransmissions/time‑based progress.
 
-The output is an [`Output`][output] enum with borrowed
-references into your provided buffer:
+The output is an [`Output`][output] enum with borrowed output data:
 - `Packet(&[u8])`: send on your UDP socket
 - `Timeout(Instant)`: schedule a timer and call `handle_timeout` at/after it
 - `Connected`: handshake complete
@@ -111,26 +112,37 @@ fn example_event_loop(mut dtls: Dtls) -> Result<(), dimpl::Error> {
         // Drain engine output until we have to wait for I/O or a timer
         let mut out_buf = vec![0u8; 2048];
         loop {
-            match dtls.poll_output(&mut out_buf) {
-                Output::Packet(p) => send_udp(p),
-                Output::Timeout(t) => { next_wake = Some(t); break; }
-                Output::Connected => {
-                    // DTLS established — application may start sending
+            let output_buf = loop {
+                match dtls.output_buffer(&mut out_buf) {
+                    Ok(output_buf) => break output_buf,
+                    Err(err) => out_buf.resize(err.minimum(), 0),
                 }
-                Output::PeerCert(_der) => {
+            };
+
+            match dtls.poll_output(output_buf) {
+                Err(err) => {
+                    out_buf.resize(err.minimum(), 0);
+                    continue;
+                }
+                Ok(Output::Packet(p)) => send_udp(p),
+                Ok(Output::Timeout(t)) => { next_wake = Some(t); break; }
+                Ok(Output::Connected) => {
+                    // DTLS established - application may start sending
+                }
+                Ok(Output::PeerCert(_der)) => {
                     // Inspect peer leaf certificate if desired
                 }
-                Output::KeyingMaterial(_km, _profile) => {
+                Ok(Output::KeyingMaterial(_km, _profile)) => {
                     // Provide to SRTP stack
                 }
-                Output::ApplicationData(_data) => {
+                Ok(Output::ApplicationData(_data)) => {
                     // Deliver plaintext to application
                 }
-                Output::CloseNotify => {
-                    // Peer initiated graceful shutdown — leave the event loop
+                Ok(Output::CloseNotify) => {
+                    // Peer initiated graceful shutdown - leave the event loop
                     return Ok(());
                 }
-                _ => {}
+                Ok(_) => {}
             }
         }
 
@@ -199,6 +211,7 @@ Rust 1.85.0
 [new_auto]: https://docs.rs/dimpl/latest/dimpl/struct.Dtls.html#method.new_auto
 [peer_cert]: https://docs.rs/dimpl/latest/dimpl/enum.Output.html#variant.PeerCert
 [handle_packet]: https://docs.rs/dimpl/latest/dimpl/struct.Dtls.html#method.handle_packet
+[output_buffer]: https://docs.rs/dimpl/latest/dimpl/struct.Dtls.html#method.output_buffer
 [poll_output]: https://docs.rs/dimpl/latest/dimpl/struct.Dtls.html#method.poll_output
 [handle_timeout]: https://docs.rs/dimpl/latest/dimpl/struct.Dtls.html#method.handle_timeout
 [output]: https://docs.rs/dimpl/latest/dimpl/enum.Output.html

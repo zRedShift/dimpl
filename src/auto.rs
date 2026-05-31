@@ -20,6 +20,14 @@ use std::time::{Duration, Instant};
 
 use arrayvec::ArrayVec;
 
+use crate::Config;
+use crate::CryptoError;
+use crate::DtlsCertificate;
+use crate::Error;
+use crate::Output;
+use crate::OutputBuffer;
+use crate::SeededRng;
+use crate::TimeoutError;
 use crate::buffer::Buf;
 use crate::crypto::ActiveKeyExchange;
 use crate::dtls13::message::KeyShareClientHello;
@@ -29,7 +37,6 @@ use crate::dtls13::message::SignatureAlgorithmsExtension;
 use crate::dtls13::message::SupportedGroupsExtension;
 use crate::dtls13::message::UseSrtpExtension;
 use crate::types::NamedGroup;
-use crate::{Config, CryptoError, DtlsCertificate, Error, Output, SeededRng, TimeoutError};
 // Extension type constants
 const EXT_SUPPORTED_GROUPS: u16 = 0x000A;
 const EXT_EC_POINT_FORMATS: u16 = 0x000B;
@@ -314,17 +321,11 @@ impl ClientPending {
         Ok(())
     }
 
-    pub fn poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Output<'a> {
+    pub fn poll_output<'a>(&mut self, buf: OutputBuffer<'a>) -> Output<'a> {
         if self.needs_send {
+            let buf = buf.into_mut();
             let len = self.wire_packet.len();
-            if buf.len() < len {
-                // Buffer too small; keep needs_send armed so the packet
-                // is emitted on the next poll with a sufficiently large buffer.
-                let next = self
-                    .retransmit_at
-                    .unwrap_or(self.last_now + Duration::from_secs(1));
-                return Output::Timeout(next);
-            }
+            assert!(len <= buf.len(), "validated output buffer too small");
             self.needs_send = false;
             buf[..len].copy_from_slice(&self.wire_packet);
             return Output::Packet(&buf[..len]);
@@ -333,6 +334,14 @@ impl ClientPending {
             .retransmit_at
             .unwrap_or(self.last_now + Duration::from_secs(1));
         Output::Timeout(next)
+    }
+
+    pub(crate) fn output_buffer_minimum(&self) -> usize {
+        self.config.mtu().max(if self.needs_send {
+            self.wire_packet.len()
+        } else {
+            0
+        })
     }
 
     pub fn into_parts(self) -> (HybridClientHello, Arc<Config>, DtlsCertificate, Instant) {

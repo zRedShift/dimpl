@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dimpl::Dtls;
+use dimpl::{Config, Dtls, Output};
 
 use crate::common::*;
 
@@ -93,6 +93,80 @@ fn dtls12_application_data_exchange() {
         client_received, server_data,
         "Client should receive server's data"
     );
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
+fn dtls12_output_buffer_rejects_buffers_smaller_than_mtu() {
+    let _ = env_logger::try_init();
+
+    let now = Instant::now();
+    let (mut client, mut server, _) = setup_connected_12_pair(now);
+
+    client.send_application_data(b"hello").expect("client send");
+
+    let mut tiny_packet_buf = [0u8; 4];
+    let tiny_packet_len = tiny_packet_buf.len();
+    let err = client
+        .output_buffer(&mut tiny_packet_buf)
+        .expect_err("undersized packet buffer should be rejected before polling");
+    assert_eq!(err.actual(), tiny_packet_len);
+    assert!(err.minimum() > tiny_packet_len);
+
+    let mut packet_buf = vec![0u8; 2048];
+    let packet = match poll_output(&mut client, &mut packet_buf) {
+        Output::Packet(packet) => packet.to_vec(),
+        output => panic!("large buffer should yield Packet, got: {output:?}"),
+    };
+    server.handle_packet(&packet).expect("server handle packet");
+
+    let mut tiny_app_buf = [0u8; 2];
+    let tiny_app_len = tiny_app_buf.len();
+    let err = server
+        .output_buffer(&mut tiny_app_buf)
+        .expect_err("undersized app-data buffer should be rejected before polling");
+    assert_eq!(err.actual(), tiny_app_len);
+    assert!(err.minimum() > tiny_app_len);
+
+    let mut app_buf = vec![0u8; 2048];
+    match poll_output(&mut server, &mut app_buf) {
+        Output::ApplicationData(data) => assert_eq!(data, b"hello"),
+        output => panic!("large buffer should yield ApplicationData, got: {output:?}"),
+    }
+}
+
+#[test]
+#[cfg(feature = "rcgen")]
+fn dtls12_output_buffer_minimum_tracks_queued_oversized_app_data() {
+    let _ = env_logger::try_init();
+
+    let now = Instant::now();
+    let (mut client, mut server, _) = setup_connected_12_pair(now);
+
+    let app_data = vec![0x42; Config::default().mtu() + 1];
+    client
+        .send_application_data(&app_data)
+        .expect("client send");
+
+    let mut packet_buf = vec![0u8; app_data.len() + 512];
+    let packet = match poll_output(&mut client, &mut packet_buf) {
+        Output::Packet(packet) => packet.to_vec(),
+        output => panic!("large buffer should yield Packet, got: {output:?}"),
+    };
+    server.handle_packet(&packet).expect("server handle packet");
+
+    let mut mtu_buf = vec![0u8; Config::default().mtu()];
+    let err = server
+        .output_buffer(&mut mtu_buf)
+        .expect_err("queued oversized app data should raise output-buffer minimum");
+    assert_eq!(err.actual(), Config::default().mtu());
+    assert_eq!(err.minimum(), app_data.len());
+
+    let mut app_buf = vec![0u8; err.minimum()];
+    match poll_output(&mut server, &mut app_buf) {
+        Output::ApplicationData(data) => assert_eq!(data, app_data),
+        output => panic!("large buffer should yield ApplicationData, got: {output:?}"),
+    }
 }
 
 #[test]
@@ -404,6 +478,13 @@ fn dtls12_large_application_data() {
     client
         .send_application_data(&large_data)
         .expect("client send large data");
+
+    let mut mtu_buf = vec![0u8; 1150];
+    let err = client
+        .output_buffer(&mut mtu_buf)
+        .expect_err("queued oversized packet should raise output-buffer minimum");
+    assert_eq!(err.actual(), 1150);
+    assert!(err.minimum() > 1150);
 
     let mut server_received: Vec<u8> = Vec::new();
 

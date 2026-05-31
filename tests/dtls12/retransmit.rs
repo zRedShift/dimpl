@@ -594,7 +594,7 @@ fn append_record(mut packet: Vec<u8>, record: &[u8]) -> Vec<u8> {
 fn poll_one_packet(endpoint: &mut Dtls) -> Vec<u8> {
     let mut buf = vec![0u8; 2048];
     loop {
-        match endpoint.poll_output(&mut buf) {
+        match poll_output(endpoint, &mut buf) {
             Output::Packet(packet) => return packet.to_vec(),
             Output::Timeout(_) => panic!("expected queued packet"),
             _ => {}
@@ -939,7 +939,7 @@ fn dtls12_retransmit_exponential_backoff() {
     // Collect the first timeout
     let mut buf = vec![0u8; 2048];
     loop {
-        if let Output::Timeout(t) = client.poll_output(&mut buf) {
+        if let Output::Timeout(t) = poll_output(&mut client, &mut buf) {
             timeouts.push(t);
             break;
         }
@@ -954,7 +954,7 @@ fn dtls12_retransmit_exponential_backoff() {
 
         // Collect the next timeout
         loop {
-            if let Output::Timeout(t) = client.poll_output(&mut buf) {
+            if let Output::Timeout(t) = poll_output(&mut client, &mut buf) {
                 timeouts.push(t);
                 break;
             }

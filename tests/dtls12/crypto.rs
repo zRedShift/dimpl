@@ -7,6 +7,7 @@ use std::time::Instant;
 use dimpl::crypto::{Dtls12CipherSuite, SignatureAlgorithm};
 use dimpl::{Config, Dtls, Output};
 
+use crate::common::poll_output;
 use crate::ossl_helper::{DtlsCertOptions, DtlsEvent, DtlsPKeyType, OsslDtlsCert};
 
 const GROUPS_PREFER_X25519: &str = "X25519:P-256:P-384";
@@ -155,7 +156,7 @@ fn run_dimpl_client_vs_ossl_server_for_suite(suite: Dtls12CipherSuite) {
         client.handle_timeout(Instant::now()).unwrap();
         // Drain client outputs
         loop {
-            match client.poll_output(&mut out_buf) {
+            match poll_output(&mut client, &mut out_buf) {
                 Output::Packet(data) => {
                     server
                         .handle_receive(data, &mut server_events)
@@ -273,7 +274,7 @@ fn run_ossl_client_vs_dimpl_server_for_suite(suite: Dtls12CipherSuite) {
 
         // 2) Poll server outputs and feed to client
         loop {
-            match server.poll_output(&mut out_buf) {
+            match poll_output(&mut server, &mut out_buf) {
                 Output::Packet(data) => {
                     if server_kx_group.is_none() {
                         server_kx_group = find_server_key_exchange_group(data);
